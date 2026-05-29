@@ -2,8 +2,9 @@ name: recyclarr drift check
 
 on:
   schedule:
-    # 06:00 UTC daily. GitHub cron is always UTC; there is no timezone field.
-    - cron: "0 6 * * *"
+    # Every 3 hours. GitHub cron is always UTC; there is no timezone field.
+    # The check is light (docker list + a ~15KB schema fetch), so this is cheap.
+    - cron: "0 */3 * * *"
   workflow_dispatch: {}
 
 # Least privilege: only what this job needs. Everything else defaults to none.

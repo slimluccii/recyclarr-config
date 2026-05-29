@@ -1,0 +1,40 @@
+# yaml-language-server: $schema=https://schemas.recyclarr.dev/latest/config-schema.json
+#
+# Basic Recyclarr config template. Replace with your real config.
+#
+# Credentials use the !env_var tag -> resolved from environment variables at
+# `recyclarr sync` time (on your server / locally). The CI drift check never
+# connects to Sonarr/Radarr and ignores these values, so no secrets are needed
+# in GitHub.
+#
+# trash_ids are commented out on purpose: with none referenced, the drift check
+# has nothing to flag, so this template never produces a false "stale id" alert.
+# Uncomment / add yours from: recyclarr list custom-formats sonarr|radarr
+
+sonarr:
+  main:
+    base_url: !env_var SONARR_URL
+    api_key: !env_var SONARR_API_KEY
+
+    # quality_definition:
+    #   type: series
+
+    # custom_formats:
+    #   - trash_ids:
+    #       - <trash_id>
+    #     assign_scores_to:
+    #       - name: <quality profile name>
+
+radarr:
+  main:
+    base_url: !env_var RADARR_URL
+    api_key: !env_var RADARR_API_KEY
+
+    # quality_definition:
+    #   type: movie
+
+    # custom_formats:
+    #   - trash_ids:
+    #       - <trash_id>
+    #     assign_scores_to:
+    #       - name: <quality profile name>

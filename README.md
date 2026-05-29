@@ -12,7 +12,7 @@ When drift is detected, the workflow opens a single GitHub issue tagged **`recyc
 
 ```
 .
-├── recyclarr.yml                 # your config (root) — add this yourself
+├── recyclarr.yml                 # config (root) — starts as a template, replace with yours
 ├── scripts/
 │   └── check_drift.py            # the drift-check logic
 ├── schema-snapshot.json          # last-seen Recyclarr config schema (auto-committed)
@@ -47,7 +47,9 @@ After reporting a schema diff, the workflow **commits the updated `schema-snapsh
 
 ## Schedule
 
-- **Daily at 06:00 UTC** via `cron`.
+- **Every 3 hours** via `cron` (`0 */3 * * *`, UTC). The check is light — a docker
+  `list` and a ~15KB schema fetch — so frequent runs are cheap. Note: on a
+  **private** repo this consumes Actions minutes (~8 runs/day); public repos run free.
 - Plus a manual **"Run workflow"** button (`workflow_dispatch`) in the Actions tab.
 
 ## Environment variables
@@ -82,12 +84,15 @@ server or local machine — by exporting the matching environment variables ther
 
 ## Getting started
 
-1. Drop your `recyclarr.yml` in the repo root.
-2. Commit and push.
-3. Done — the daily check picks it up automatically.
+The repo ships a **template `recyclarr.yml`** with the structure and `!env_var`
+credentials wired up but no active `trash_ids` (so it raises no drift). To go live:
 
-Until `recyclarr.yml` exists, the trash_id check no-ops and the run stays green
-(the schema check still runs), so you can set up the repo before the config is ready.
+1. Replace `recyclarr.yml` with your real config (or uncomment + fill the template).
+2. Commit and push.
+3. Done — the next run validates your `trash_ids` automatically.
+
+While the config has no `trash_ids` referenced, the trash_id check no-ops and the
+run stays green (the schema check still runs).
 
 ## Permissions
 
