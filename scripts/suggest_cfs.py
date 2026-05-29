@@ -33,13 +33,52 @@ Processing:
      temperature 0, structured JSON via a tool schema with no score field).
   6. Validate + defensively strip scores + sort each service by confidence desc.
 
-Output: suggestions.json (committed back by the workflow) shaped as:
+Output 1: suggestions.json (committed back by the workflow) shaped as:
   {
     "generated_for_config_hash": "<sha256 of recyclarr.yml bytes>",
     "generated_for_catalog_hash": "<sha256 of combined guide catalog>",
     "sonarr": [{"trash_id","name","category","why_it_fits","confidence"}, ...],
     "radarr": [ ... ]
   }
+
+Output 2: /tmp/ai_changes.json -- the per-change work-units consumed by
+manage_prs.py (one PR per change). It carries TWO kinds of change-record (see the
+SHARED CONTRACTS in the task spec):
+  {"changes": [ ...<"suggestion"> and <"settings"> change-records... ]}
+
+  * "suggestion" (add a custom format): for each fitting candidate CF, the AI also
+    picks the best assign_scores_to profile from the user's existing quality
+    profiles. Per the locked decision we ALWAYS open the PR with that best guess
+    and set uncertain=true (+ explain in the body) when the model isn't confident.
+    new_config is produced by recyclarr_patch.add_custom_format (NO score, ever).
+
+  * "settings" (naming/quality/profile alignment): the recommended VALUE is sourced
+    ONLY from recyclarr's own config-templates repo -- never invented by the AI. In
+    practice the only concrete, score-free value the templates expose
+    deterministically is `quality_definition.type` (movie/series), so this script
+    proposes setting `<service>.<instance>.quality_definition.type` when the user
+    has clear intent for a service but no quality_definition. Anything we cannot
+    ground in a fetched template value is SKIPPED with a logged reason -- we degrade
+    gracefully rather than guess. new_config is produced by
+    recyclarr_patch.set_setting. (See SETTINGS-TEMPLATE SOURCING note below.)
+
+ai_changes.json is ALWAYS written (even as {"changes": []}) so manage_prs.py has a
+well-formed input regardless of API/key/network outcome.
+
+SETTINGS-TEMPLATE SOURCING (feasibility, decided after investigation)
+---------------------------------------------------------------------
+recyclarr's config templates live in the public github.com/recyclarr/config-templates
+repo (default branch `main`), indexed by templates.json / includes.json and fetched
+as raw YAML. They are fetchable read-only with no auth. BUT almost every template's
+"settings" are either (a) custom-format trash_ids carrying SCORES (opt-in only --
+forbidden to emit here) or (b) quality-PROFILE definitions that also carry scores.
+The repo has NO media-naming templates. The ONLY broadly-applicable, concrete,
+score-free value the includes expose is the quality definition TYPE
+(`quality_definition: {type: movie|series}`). So settings alignment is implemented
+narrowly and honestly: we source `quality_definition.type` from the matching
+template include and propose it only when missing. Richer settings alignment
+(media naming, format scoring) is intentionally deferred: it cannot be sourced
+without emitting scores or inventing values, both of which the spec forbids.
 
 Exit code:
   - Always 0 on normal completion AND on graceful degradation. A missing API key,
@@ -52,13 +91,30 @@ Exit code:
 import hashlib
 import json
 import os
+import re
 import sys
+from urllib.request import urlopen, Request
+from urllib.error import URLError, HTTPError
 
 try:
     import yaml
 except ImportError:
     print("ERROR: pyyaml is required (pip install pyyaml)", file=sys.stderr)
     sys.exit(2)
+
+# recyclarr_patch.py is the SHARED round-trip mutation layer. Every change-record's
+# new_config is produced by exactly one of its mutators against the CURRENT repo
+# recyclarr.yml text, so each PR's diff is a single surgical edit. It lives beside
+# this script; import is best-effort so the suggestions.json path (which never needs
+# it) still works if ruamel.yaml is unavailable -- in that case we just skip the
+# ai_changes.json change-building and still write an empty changes file.
+try:
+    import recyclarr_patch
+except ImportError as _patch_exc:  # pragma: no cover - exercised only on broken envs
+    recyclarr_patch = None
+    _PATCH_IMPORT_ERROR = _patch_exc
+else:
+    _PATCH_IMPORT_ERROR = None
 
 
 # --------------------------------------------------------------------------- #
@@ -92,6 +148,26 @@ SUGGESTIONS_PATH = os.path.join(REPO_ROOT, "suggestions.json")
 
 CF_SONARR_PATH = "/tmp/cf_sonarr.txt"
 CF_RADARR_PATH = "/tmp/cf_radarr.txt"
+
+# Per-change work-units for manage_prs.py (one PR per change). Always written.
+AI_CHANGES_PATH = "/tmp/ai_changes.json"
+
+# recyclarr's own public config-templates repo -- the ONLY authoritative source we
+# allow for "settings" values (so we never invent one). Raw files are served at
+# <RAW_BASE>/<path> with no auth. The quality-definition includes live under
+# <service>/includes/quality-definitions/ and contain just `quality_definition:
+# {type: ...}` -- a concrete, score-free value we can lift verbatim. We pin to the
+# default branch; a 404 / network error simply means we skip the settings change.
+CONFIG_TEMPLATES_RAW_BASE = (
+    "https://raw.githubusercontent.com/recyclarr/config-templates/main/"
+)
+# Per service, the include file whose `quality_definition.type` we propose when the
+# user has intent but no quality_definition set. These are the standard movie/series
+# definitions (the anime ones target a narrower audience, so we don't auto-suggest).
+QUALITY_DEFINITION_TEMPLATES = {
+    "radarr": "radarr/includes/quality-definitions/radarr-quality-definition-movie.yml",
+    "sonarr": "sonarr/includes/quality-definitions/sonarr-quality-definition-series.yml",
+}
 
 # claude-haiku-4-5, temperature 0 -- locked decisions for determinism + low cost.
 MODEL = "claude-haiku-4-5"
@@ -172,7 +248,8 @@ def extract_intent(config):
     Walk a parsed recyclarr.yml and return, per service:
         {
           "sonarr": {"profile_trash_ids": set, "profile_names": set,
-                     "referenced_cf_ids": set},
+                     "referenced_cf_ids": set, "instance_names": list,
+                     "has_quality_definition": bool},
           "radarr": {...},
         }
 
@@ -185,6 +262,13 @@ def extract_intent(config):
                              custom_format_groups[].trash_ids -- everything the
                              user already syncs, so we can exclude it from
                              candidates.
+      * instance_names     = ordered list of instance keys under the service (e.g.
+                             ["main"]). Used to build the dotted settings path
+                             `<service>.<instance>.quality_definition.type`; the
+                             settings change only fires when there is exactly one.
+      * has_quality_definition = True if ANY instance already has a
+                             `quality_definition` key (so we don't propose one that
+                             already exists).
 
     Expected structure (parsed defensively -- tolerate missing keys, None values,
     and unexpected types; a malformed config must not crash the engine):
@@ -200,9 +284,11 @@ def extract_intent(config):
     """
     out = {
         "sonarr": {"profile_trash_ids": set(), "profile_names": set(),
-                   "referenced_cf_ids": set()},
+                   "referenced_cf_ids": set(), "instance_names": [],
+                   "has_quality_definition": False},
         "radarr": {"profile_trash_ids": set(), "profile_names": set(),
-                   "referenced_cf_ids": set()},
+                   "referenced_cf_ids": set(), "instance_names": [],
+                   "has_quality_definition": False},
     }
     if not isinstance(config, dict):
         return out
@@ -213,9 +299,18 @@ def extract_intent(config):
             continue
         bucket = out[service]
 
-        for instance in service_block.values():
+        for instance_name, instance in service_block.items():
             if not isinstance(instance, dict):
                 continue
+
+            # Record the instance key so a settings change can address it by its
+            # exact dotted path; keep order (recyclarr preserves it) for determinism.
+            bucket["instance_names"].append(str(instance_name))
+
+            # Note whether a quality_definition already exists anywhere -- if so we
+            # never propose one (the settings change is fill-the-gap only).
+            if instance.get("quality_definition") is not None:
+                bucket["has_quality_definition"] = True
 
             # ----- quality profiles (intent signal) ------------------------- #
             profiles = instance.get("quality_profiles")
@@ -346,10 +441,18 @@ SYSTEM_PROMPT = (
     "return an empty list for a service when nothing clearly fits.\n"
     "5. Use only the candidate CFs provided. Never invent a trash_id, name, or "
     "category, and never suggest a CF the user already syncs.\n"
+    "6. For each suggested CF you MUST also pick which of the user's EXISTING "
+    "quality profiles the CF should be assigned to (assign_profile). Choose from "
+    "the profile names listed for that service; pick the single best fit. NEVER "
+    "invent a profile name. If the user has no usable profile names for that "
+    "service, or you are genuinely unsure which profile fits best, still pick your "
+    "single best guess and set assign_uncertain to true so a human reviews it.\n"
     "\n"
-    "For each suggested CF give a one-sentence why_it_fits grounded in its "
-    "name/category and the user's profiles, and a confidence of high, medium, or "
-    "low. Output via the provided tool only."
+    "For each suggested CF give: a one-sentence why_it_fits grounded in its "
+    "name/category and the user's profiles; a confidence of high, medium, or low; "
+    "the chosen assign_profile (an existing profile name); and assign_uncertain "
+    "(true when you are not confident about the profile choice). Output via the "
+    "provided tool only. Remember: no scores, ever."
 )
 
 # Tool schema: deliberately NO score field anywhere. Structured JSON output keeps
@@ -376,6 +479,12 @@ SUGGESTION_TOOL = {
                             "type": "string",
                             "enum": ["high", "medium", "low"],
                         },
+                        # Best-guess existing profile to assign the CF to, plus a
+                        # flag the model raises when it isn't confident about that
+                        # choice. NEITHER is a score; assign_profile is only ever an
+                        # existing profile NAME (validated against the config).
+                        "assign_profile": {"type": "string"},
+                        "assign_uncertain": {"type": "boolean"},
                     },
                     "required": ["trash_id", "name", "why_it_fits", "confidence"],
                     "additionalProperties": False,
@@ -394,6 +503,8 @@ SUGGESTION_TOOL = {
                             "type": "string",
                             "enum": ["high", "medium", "low"],
                         },
+                        "assign_profile": {"type": "string"},
+                        "assign_uncertain": {"type": "boolean"},
                     },
                     "required": ["trash_id", "name", "why_it_fits", "confidence"],
                     "additionalProperties": False,
@@ -435,15 +546,24 @@ def build_user_content(intent, candidates_by_service):
     for service in ("sonarr", "radarr"):
         bucket = intent[service]
         synced = sorted(bucket["referenced_cf_ids"])
+        # The assignable profile NAMES the model may pick for assign_profile. Only
+        # 'name'-carrying profiles are assignable targets in recyclarr's
+        # assign_scores_to; trash_id-only profiles have no stable name to address.
+        assignable = sorted(bucket["profile_names"])
         sections.append(
             "=== {svc} ===\n"
             "Quality profiles (the user's intent):\n{profiles}\n\n"
+            "Assignable profile names (pick assign_profile from EXACTLY these; "
+            "never invent one):\n{assignable}\n\n"
             "Custom formats already synced (exclude these; do not re-suggest):\n"
             "{synced}\n\n"
             "Candidate custom formats (trash_id | name | category) -- judge fit "
-            "against the profiles above:\n{candidates}".format(
+            "against the profiles above, and for each fit pick the best "
+            "assign_profile:\n{candidates}".format(
                 svc=service,
                 profiles=_format_profiles(bucket),
+                assignable="\n".join("- {}".format(a) for a in assignable)
+                if assignable else "(none)",
                 synced="\n".join("- {}".format(s) for s in synced) if synced else "(none)",
                 candidates=_format_candidates(candidates_by_service[service]),
             )
@@ -527,6 +647,386 @@ def validate_suggestions(raw_list, candidates_by_service_ids, service):
 
 
 # --------------------------------------------------------------------------- #
+# Assignment extraction (assign_profile + uncertainty for CF-add change-records)
+# --------------------------------------------------------------------------- #
+#
+# suggestions.json deliberately stays a pure fit-judgment artifact (no profile, no
+# uncertainty) -- its schema is frozen by the assembler + tests. The assign_profile
+# the model picked is needed ONLY to BUILD a "suggestion" change-record, so we read
+# it from the raw tool output here, keyed by trash_id, rather than threading it
+# through validate_suggestions' frozen allow-list output.
+
+def extract_assignments(raw_list, assignable_profile_names):
+    """
+    From the model's raw per-service list, return {trash_id: {"assign_profile",
+    "assign_uncertain"}} for use when building CF-add change-records.
+
+    Defensive + grounded:
+      * assign_profile is accepted ONLY if it exactly matches one of the user's
+        EXISTING profile names (the model must never invent a profile). An
+        unrecognised / missing pick is recorded as None so the caller can fall back
+        to the single existing profile and flag uncertainty.
+      * assign_uncertain is coerced to a bool; a missing flag defaults to True
+        (conservative -- absence of a clear signal means "have a human check").
+      * NO score field is read or carried (there is none in the schema).
+    """
+    out = {}
+    if not isinstance(raw_list, list):
+        return out
+    valid_names = set(assignable_profile_names or [])
+
+    for item in raw_list:
+        if not isinstance(item, dict):
+            continue
+        tid = item.get("trash_id")
+        if not isinstance(tid, str):
+            continue
+        tid = tid.strip().lower()
+        if not tid:
+            continue
+
+        picked = item.get("assign_profile")
+        picked = picked.strip() if isinstance(picked, str) else ""
+        # Only honour a pick that names a real existing profile.
+        assign_profile = picked if picked in valid_names else None
+
+        uncertain = item.get("assign_uncertain")
+        assign_uncertain = bool(uncertain) if isinstance(uncertain, bool) else True
+
+        out[tid] = {
+            "assign_profile": assign_profile,
+            "assign_uncertain": assign_uncertain,
+        }
+    return out
+
+
+# --------------------------------------------------------------------------- #
+# Settings-template sourcing (authoritative VALUES only -- never invented)
+# --------------------------------------------------------------------------- #
+#
+# See the SETTINGS-TEMPLATE SOURCING note in the module docstring for the full
+# feasibility rationale. The short version: the only concrete, score-free value the
+# recyclarr config-templates repo exposes deterministically is the quality
+# definition TYPE. We fetch the matching include, parse out
+# `quality_definition.type`, and that is the ONLY value we will ever propose via a
+# settings change. If the fetch/parse fails we return None and the caller skips the
+# change with a logged reason (graceful degradation -- we never guess a value).
+
+def _http_get_text(url, timeout=30):
+    """GET a URL and return its decoded text body. Raises on network/HTTP error."""
+    req = Request(url, headers={"User-Agent": "recyclarr-suggest-cfs"})
+    with urlopen(req, timeout=timeout) as resp:
+        return resp.read().decode("utf-8")
+
+
+def fetch_quality_definition_type(service):
+    """
+    Fetch the recyclarr config-templates quality-definition include for `service`
+    and return its `quality_definition.type` value (e.g. "movie" / "series"), or
+    None if the template can't be fetched/parsed.
+
+    This is the ONLY settings value we source. We parse with the same !env_var-
+    tolerant loader used everywhere here (the template won't contain the tag, but
+    reusing the loader keeps parsing uniform and can't choke on one if it appears).
+    Any error -- unknown service, network failure, malformed YAML, missing key --
+    degrades to None so the caller skips the settings change rather than inventing.
+    """
+    rel = QUALITY_DEFINITION_TEMPLATES.get(service)
+    if not rel:
+        return None
+    url = CONFIG_TEMPLATES_RAW_BASE + rel
+    try:
+        text = _http_get_text(url)
+    except (URLError, HTTPError, OSError) as exc:
+        print("WARNING: could not fetch quality-definition template for {} ({}): {}"
+              .format(service, url, exc), file=sys.stderr)
+        return None
+    try:
+        doc = yaml.load(text, Loader=RecyclarrLoader)
+    except yaml.YAMLError as exc:
+        print("WARNING: could not parse quality-definition template for {}: {}"
+              .format(service, exc), file=sys.stderr)
+        return None
+
+    qd = doc.get("quality_definition") if isinstance(doc, dict) else None
+    qtype = qd.get("type") if isinstance(qd, dict) else None
+    if not isinstance(qtype, str) or not qtype.strip():
+        print("WARNING: quality-definition template for {} had no usable type; "
+              "skipping settings change".format(service), file=sys.stderr)
+        return None
+    return qtype.strip()
+
+
+# --------------------------------------------------------------------------- #
+# Change-record construction (the per-change work-units for manage_prs.py)
+# --------------------------------------------------------------------------- #
+#
+# Each change-record is a self-contained unit a single PR is built from. new_config
+# is ALWAYS the CURRENT repo recyclarr.yml text with EXACTLY this one change applied
+# via a recyclarr_patch mutator -- so every PR diff is a single surgical edit and no
+# record can ever carry a score (the mutators have no code path that writes one).
+
+def _sanitize_branch_segment(text):
+    """
+    Make a dotted path / id safe for a git branch name: lowercase, and replace any
+    run of non [a-z0-9._-] characters with a single '-'. Keeps dots/underscores
+    (they're valid in refs and keep the path readable, e.g.
+    radarr.main.quality_definition.type).
+    """
+    seg = str(text).strip().lower()
+    seg = re.sub(r"[^a-z0-9._-]+", "-", seg)
+    return seg.strip("-") or "change"
+
+
+def build_suggestion_change(service, suggestion, assignment, config_text,
+                            assignable_profile_names):
+    """
+    Build a "suggestion" change-record (add a custom format) for one validated
+    suggestion, or None if it can't be built (no patch layer, or no profile to
+    assign to at all).
+
+    assign_profile selection (locked decision: ALWAYS open with a best guess):
+      * Prefer the model's pick (already validated against existing names in
+        extract_assignments).
+      * Else fall back to the single existing assignable profile name if there is
+        exactly one obvious choice.
+      * If neither yields a profile, we cannot produce a valid assign_scores_to, so
+        we skip this CF (a change with no real profile would be un-appliable).
+    uncertain is set true whenever the model flagged uncertainty OR we had to fall
+    back to a default pick -- and the body explains why, per the spec.
+    """
+    if recyclarr_patch is None:
+        return None
+
+    trash_id = suggestion["trash_id"]
+    name = suggestion["name"]
+    confidence = suggestion["confidence"]
+    why = suggestion.get("why_it_fits", "")
+
+    model_pick = assignment.get("assign_profile") if assignment else None
+    model_uncertain = assignment.get("assign_uncertain", True) if assignment else True
+
+    names = list(assignable_profile_names or [])
+    fell_back = False
+    if model_pick:
+        assign_profile = model_pick
+    elif len(names) == 1:
+        # Exactly one existing profile -> unambiguous fallback target.
+        assign_profile = names[0]
+        fell_back = True
+    else:
+        # No model pick and no single obvious profile: we can't assign safely.
+        print("INFO: skipping suggestion change for {} {}: no assignable profile "
+              "(model pick unusable, {} candidate profiles)"
+              .format(service, trash_id, len(names)), file=sys.stderr)
+        return None
+
+    # Uncertain when the model said so OR we defaulted the profile ourselves.
+    uncertain = bool(model_uncertain or fell_back or not model_pick)
+
+    try:
+        new_config = recyclarr_patch.add_custom_format(
+            config_text, service, trash_id, name, assign_profile)
+    except Exception as exc:  # noqa: BLE001 -- a bad mutate must skip, not crash run.
+        print("WARNING: could not build new_config for suggestion {} {}: {}"
+              .format(service, trash_id, exc), file=sys.stderr)
+        return None
+
+    source = (
+        "https://github.com/recyclarr/config-templates "
+        "(scores come from the TRaSH guide on opt-in)"
+    )
+    body_lines = [
+        "**Add custom format** `{}` (`{}`) to **{}**.".format(name, trash_id, service),
+        "",
+        "**Why it fits:** {}".format(why or "(fits the user's profiles)"),
+        "",
+        "**Assign to profile:** `{}`".format(assign_profile),
+        "",
+        "**Confidence:** {}".format(confidence),
+    ]
+    if uncertain:
+        reason = ("the model flagged the profile choice as uncertain"
+                  if model_uncertain and not fell_back
+                  else "no confident profile pick was available, so the only "
+                       "existing profile was used as a best guess")
+        body_lines += [
+            "",
+            "> ⚠️ **Uncertain:** {}. Please confirm the `assign_scores_to` "
+            "profile before merging.".format(reason),
+        ]
+    body_lines += [
+        "",
+        "_Note: no score is set here. Scores come from the TRaSH guide on opt-in._",
+        "",
+        "Source: {}".format(source),
+    ]
+
+    return {
+        "type": "suggestion",
+        "label": "suggestion",
+        "key": trash_id,
+        "service": service,
+        "branch": "recyclarr/suggestion/{}-{}".format(service, trash_id),
+        "title": "Add custom format: {} ({})".format(name, service),
+        "body": "\n".join(body_lines),
+        "new_config": new_config,
+        "confidence": confidence,
+        "uncertain": uncertain,
+    }
+
+
+def build_settings_change(service, intent_bucket, config_text):
+    """
+    Build a "settings" change-record proposing `quality_definition.type` for a
+    service that has clear intent but no quality_definition yet -- with the VALUE
+    sourced from recyclarr's config-templates (never invented). Returns the record,
+    or None (with a logged reason) when it shouldn't / can't be built.
+
+    Guards (degrade gracefully -- skip + log, never guess):
+      * Skip if a quality_definition already exists anywhere for the service.
+      * Skip unless there is EXACTLY one instance, so the dotted path
+        `<service>.<instance>.quality_definition.type` is unambiguous.
+      * Skip if the template value can't be fetched/parsed.
+      * Skip if the patch layer is unavailable.
+    """
+    if recyclarr_patch is None:
+        return None
+    if intent_bucket.get("has_quality_definition"):
+        return None
+
+    instances = intent_bucket.get("instance_names") or []
+    if len(instances) != 1:
+        print("INFO: skipping settings change for {}: expected exactly one instance, "
+              "found {}".format(service, len(instances)), file=sys.stderr)
+        return None
+    instance = instances[0]
+
+    qtype = fetch_quality_definition_type(service)
+    if qtype is None:
+        # fetch_quality_definition_type already logged the specific reason.
+        print("INFO: skipping settings change for {}: no template-sourced "
+              "quality_definition.type available".format(service), file=sys.stderr)
+        return None
+
+    dotted_path = "{}.{}.quality_definition.type".format(service, instance)
+    try:
+        new_config = recyclarr_patch.set_setting(config_text, dotted_path, qtype)
+    except Exception as exc:  # noqa: BLE001 -- a bad mutate must skip, not crash run.
+        print("WARNING: could not build new_config for settings change {}: {}"
+              .format(dotted_path, exc), file=sys.stderr)
+        return None
+
+    rel = QUALITY_DEFINITION_TEMPLATES[service]
+    source = CONFIG_TEMPLATES_RAW_BASE + rel
+    body = "\n".join([
+        "**Align quality definition** for **{}**.".format(service),
+        "",
+        "Set `{}` to `{}`.".format(dotted_path, qtype),
+        "",
+        "This value is taken verbatim from recyclarr's own config template "
+        "(`{}`), not invented. recyclarr uses the quality definition to size each "
+        "quality tier; aligning it matches the upstream-recommended baseline for "
+        "this service.".format(rel),
+        "",
+        "_Note: no score is set here -- this only sets the quality definition type. "
+        "Scores come from the TRaSH guide on opt-in._",
+        "",
+        "Source: {}".format(source),
+    ])
+
+    return {
+        "type": "settings",
+        "label": "settings",
+        "key": dotted_path,
+        "service": service,
+        "branch": "recyclarr/settings/{}".format(_sanitize_branch_segment(dotted_path)),
+        "title": "Set {} = {}".format(dotted_path, qtype),
+        "body": body,
+        "new_config": new_config,
+        "confidence": None,
+        "uncertain": False,
+    }
+
+
+def assemble_changes(config_text, intent, suggestions_by_service,
+                     assignments_by_service):
+    """
+    Build the full ordered list of change-records (suggestion + settings) from a set
+    of validated suggestions and the assignment hints.
+
+    Used by BOTH the happy path (fresh suggestions + fresh assignments from the API)
+    and the O1-skip path (suggestions reloaded from the committed suggestions.json,
+    with empty assignments so the fallback profile logic applies). This keeps
+    ai_changes.json STABLE across non-refresh ticks: the same config + suggestions
+    deterministically yield the same change-records, so manage_prs.py won't churn
+    PRs when nothing actually changed.
+
+    `assignments_by_service` may be {} / partial; missing entries fall back to the
+    single-existing-profile heuristic inside build_suggestion_change.
+    """
+    changes = []
+    if recyclarr_patch is None:
+        return changes
+
+    for service in ("sonarr", "radarr"):
+        bucket = intent.get(service, {})
+        assignable = sorted(bucket.get("profile_names") or [])
+        assignments = (assignments_by_service or {}).get(service, {})
+
+        # 1) suggestion (add custom format) change-records.
+        for suggestion in suggestions_by_service.get(service, []) or []:
+            tid = suggestion.get("trash_id")
+            assignment = assignments.get(tid) if isinstance(assignments, dict) else None
+            change = build_suggestion_change(
+                service, suggestion, assignment, config_text, assignable)
+            if change is not None:
+                changes.append(change)
+
+        # 2) settings (quality_definition.type alignment) change-record.
+        settings_change = build_settings_change(service, bucket, config_text)
+        if settings_change is not None:
+            changes.append(settings_change)
+
+    return changes
+
+
+def _rebuild_changes_from_committed(config_text, intent):
+    """
+    Rebuild + write ai_changes.json from the COMMITTED suggestions.json (no API
+    call), for the degraded paths (O1 skip, missing key, API failure). Assignments
+    aren't persisted in suggestions.json, so we pass none and rely on the
+    single-existing-profile fallback (uncertainty flagged). Keeps the change-set
+    stable so manage_prs.py doesn't churn PRs when no fresh judgment was produced.
+    """
+    existing = load_existing_suggestions(SUGGESTIONS_PATH) or {}
+    existing_suggestions = {
+        "sonarr": existing.get("sonarr") if isinstance(existing.get("sonarr"), list) else [],
+        "radarr": existing.get("radarr") if isinstance(existing.get("radarr"), list) else [],
+    }
+    changes = assemble_changes(config_text, intent, existing_suggestions, {})
+    write_ai_changes(changes)
+    print("rebuilt {} change-record(s) from committed suggestions.json"
+          .format(len(changes)))
+
+
+def write_ai_changes(changes):
+    """
+    Write /tmp/ai_changes.json = {"changes": [...]} for manage_prs.py. ALWAYS called
+    (even with an empty list) so the reconciler has a well-formed input regardless
+    of how the run degraded. An I/O failure here is a genuine internal error -> exit 2.
+    """
+    try:
+        with open(AI_CHANGES_PATH, "w", encoding="utf-8") as fh:
+            json.dump({"changes": changes}, fh, indent=2)
+            fh.write("\n")
+    except OSError as exc:
+        print("ERROR: could not write {}: {}".format(AI_CHANGES_PATH, exc),
+              file=sys.stderr)
+        sys.exit(2)
+
+
+# --------------------------------------------------------------------------- #
 # Anthropic API call (O2: one combined call)
 # --------------------------------------------------------------------------- #
 
@@ -605,10 +1105,23 @@ def write_suggestions(config_hash, cat_hash, sonarr, radarr):
 # --------------------------------------------------------------------------- #
 
 def main():
+    # ----- always-write ai_changes.json guarantee --------------------------- #
+    # The contract requires /tmp/ai_changes.json to exist after every run, even an
+    # early-exit one. Establish an empty, well-formed file up front; the happy path
+    # overwrites it with the real change-records at the end. (write_ai_changes is
+    # idempotent and cheap.) If a patch-layer import failed, log it once -- the
+    # suggestions.json path still works, but no change-records can be built.
+    write_ai_changes([])
+    if recyclarr_patch is None:
+        print("WARNING: recyclarr_patch unavailable ({}); ai_changes.json will stay "
+              "empty (no PR change-records this run)".format(_PATCH_IMPORT_ERROR),
+              file=sys.stderr)
+
     # ----- load + hash recyclarr.yml ---------------------------------------- #
     if not os.path.isfile(CONFIG_PATH):
         # No config => nothing to infer intent from. Write empty suggestions so
-        # the assembler has a well-formed file, and exit cleanly.
+        # the assembler has a well-formed file, and exit cleanly. ai_changes.json
+        # was already written empty above.
         print("no recyclarr.yml; writing empty suggestions (no intent to infer)")
         write_suggestions(sha256_bytes(b""), catalog_hash([], []), [], [])
         sys.exit(0)
@@ -622,6 +1135,10 @@ def main():
         sys.exit(0)
 
     config_hash = sha256_bytes(config_bytes)
+
+    # Decode the raw bytes once for the patch mutators (they take TEXT). errors are
+    # replaced so an odd byte can't crash us; the config is normally clean UTF-8.
+    config_text = config_bytes.decode("utf-8", errors="replace")
 
     try:
         config = yaml.load(config_bytes, Loader=RecyclarrLoader)
@@ -666,6 +1183,11 @@ def main():
             existing.get("generated_for_catalog_hash") == cat_hash:
         print("recyclarr.yml and guide catalog unchanged since last generation; "
               "skipping Anthropic API call (suggestions.json left unchanged)")
+        # O1 skips the (paid) call, but ai_changes.json must still reflect the
+        # CURRENT desired change-set so manage_prs.py doesn't churn PRs on every
+        # non-refresh tick. Rebuild deterministically from the committed
+        # suggestions (no API call). Deterministic in => deterministic out.
+        _rebuild_changes_from_committed(config_text, intent)
         sys.exit(0)
 
     # ----- API key guard ---------------------------------------------------- #
@@ -673,6 +1195,10 @@ def main():
     if not api_key:
         print("WARNING: ANTHROPIC_API_KEY not set; skipping suggestion refresh "
               "(suggestions.json left unchanged)", file=sys.stderr)
+        # No API call possible, but rebuild ai_changes.json from whatever
+        # suggestions are already committed (+ settings, which need no API) so the
+        # change-set stays stable rather than being wiped to empty.
+        _rebuild_changes_from_committed(config_text, intent)
         sys.exit(0)
 
     # ----- O2: one combined Anthropic call ---------------------------------- #
@@ -680,9 +1206,11 @@ def main():
     tool_input = call_anthropic(api_key, user_content)
     if tool_input is None:
         # Any API/network/SDK failure: do not hard-fail the pipeline. Leave any
-        # existing suggestions.json intact and exit 0.
+        # existing suggestions.json intact and rebuild ai_changes.json from it (so
+        # we don't churn PRs just because one daily call failed).
         print("suggestion refresh skipped due to API issue; "
               "suggestions.json left unchanged")
+        _rebuild_changes_from_committed(config_text, intent)
         sys.exit(0)
 
     # ----- validate + defensively strip scores + sort ----------------------- #
@@ -699,7 +1227,24 @@ def main():
 
     write_suggestions(config_hash, cat_hash, sonarr_out, radarr_out)
 
+    # ----- build the per-change work-units (ai_changes.json) ----------------- #
+    # The model's assign_profile + uncertainty picks live OUTSIDE suggestions.json
+    # (its schema is frozen), so we read them straight from the raw tool output,
+    # validated against the user's existing profile names. Then assemble suggestion
+    # + settings change-records and overwrite the empty ai_changes.json from earlier.
+    assignments = {
+        "sonarr": extract_assignments(tool_input.get("sonarr"),
+                                      sorted(intent["sonarr"]["profile_names"])),
+        "radarr": extract_assignments(tool_input.get("radarr"),
+                                      sorted(intent["radarr"]["profile_names"])),
+    }
+    suggestions_by_service = {"sonarr": sonarr_out, "radarr": radarr_out}
+    changes = assemble_changes(config_text, intent, suggestions_by_service, assignments)
+    write_ai_changes(changes)
+
     # ----- human summary ---------------------------------------------------- #
+    settings_changes = sum(1 for c in changes if c["type"] == "settings")
+    suggestion_changes = sum(1 for c in changes if c["type"] == "suggestion")
     print("")
     print("=== recyclarr CF suggestions ===")
     print("config hash:           {}".format(config_hash[:12]))
@@ -708,7 +1253,10 @@ def main():
     print("radarr candidates:     {}".format(len(candidates["radarr"])))
     print("sonarr suggestions:    {}".format(len(sonarr_out)))
     print("radarr suggestions:    {}".format(len(radarr_out)))
+    print("suggestion changes:    {}".format(suggestion_changes))
+    print("settings changes:      {}".format(settings_changes))
     print("written to {}".format(SUGGESTIONS_PATH))
+    print("changes written to {}".format(AI_CHANGES_PATH))
 
     sys.exit(0)
 

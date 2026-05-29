@@ -34,6 +34,14 @@ Output:
          "stale_radarr": [...],
          "new_schema_props": [...],
          "issue_body": "<markdown>"}
+    (UNCHANGED -- the status-issue assembler still consumes exactly this shape.)
+  - /tmp/drift_changes.json with:
+        {"changes": [<drift change-record>, ...],
+         "feature_issues": [<feature-issue record>, ...]}
+    The PR manager (manage_prs.py) builds one PR per drift change-record and one
+    labeled issue per feature-issue record. See the "change-record" docstring on
+    build_drift_changes() for the exact field contract. Always written (even when
+    both lists are empty) so the manager can reconcile a now-clean state.
   - A human-readable summary to stdout.
 
 Exit code:
@@ -54,6 +62,21 @@ try:
 except ImportError:
     print("ERROR: pyyaml is required (pip install pyyaml)", file=sys.stderr)
     sys.exit(2)
+
+# recyclarr_patch lives alongside this script in scripts/. The workflow invokes
+# us as `python scripts/check_drift.py`, so scripts/ is not implicitly importable;
+# we add this file's own directory to sys.path before importing the sibling. The
+# import is best-effort: if the round-trip editor (or its ruamel.yaml dep) is
+# unavailable, drift detection + /tmp/drift_result.json still work; we just can't
+# build per-change new_config patches, so the change list degrades to empty.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+try:
+    import recyclarr_patch
+except ImportError as exc:  # ruamel.yaml missing, or sibling not present.
+    print("WARNING: recyclarr_patch unavailable ({}); drift change-records "
+          "will be empty (drift_result.json unaffected)".format(exc),
+          file=sys.stderr)
+    recyclarr_patch = None
 
 
 # --------------------------------------------------------------------------- #
@@ -90,9 +113,19 @@ SNAPSHOT_PATH = os.path.join(REPO_ROOT, "schema-snapshot.json")
 CF_SONARR_PATH = "/tmp/cf_sonarr.txt"
 CF_RADARR_PATH = "/tmp/cf_radarr.txt"
 RESULT_PATH = "/tmp/drift_result.json"
+CHANGES_PATH = "/tmp/drift_changes.json"
 
 SCHEMA_BASE = "https://schemas.recyclarr.dev/latest/"
 SCHEMA_ROOT = "config-schema.json"
+
+# Upstream docs we link to in change-records / feature-issues so a human can
+# verify the finding. The TRaSH guide custom-format index is the source of truth
+# for which trash_ids exist; the recyclarr schema docs explain new config props.
+TRASH_CF_DOCS = {
+    "sonarr": "https://trash-guides.info/Sonarr/sonarr-collection-of-custom-formats/",
+    "radarr": "https://trash-guides.info/Radarr/radarr-collection-of-custom-formats/",
+}
+RECYCLARR_SCHEMA_DOCS = "https://recyclarr.dev/wiki/yaml/config-reference/"
 
 # A trash_id is a 32-char hex hash, e.g. 496f355514737f7d83bf7aa4d24f8169.
 # We anchor on word boundaries so we don't slice a longer hex token in half.
@@ -379,6 +412,171 @@ def build_issue_body(stale_sonarr, stale_radarr, new_props):
 
 
 # --------------------------------------------------------------------------- #
+# Change-records (drift PRs) + feature-issues (schema-prop issues)
+# --------------------------------------------------------------------------- #
+#
+# These feed manage_prs.py, which turns each "drift" change-record into a PR and
+# each feature-issue into a labeled issue. The unit of work is ONE change apply
+# per record (decision: per-change granularity), so each record carries the FULL
+# recyclarr.yml text with ONLY that single change applied.
+
+def _sanitize_branch_part(value):
+    """
+    Make a string safe for use in a git branch name. Lowercase, keep [a-z0-9-],
+    collapse every other run of characters to a single '-', and trim leading /
+    trailing '-'. trash_ids are already hex so this is mostly a no-op for them,
+    but it keeps branch names well-formed for any future key shape.
+    """
+    slug = re.sub(r"[^a-z0-9]+", "-", str(value).strip().lower())
+    return slug.strip("-")
+
+
+def _read_config_text():
+    """
+    Read recyclarr.yml as text for the round-trip patcher. Returns the raw string,
+    or None if the file is absent/unreadable (callers then emit no drift changes).
+    """
+    if not os.path.isfile(CONFIG_PATH):
+        return None
+    try:
+        with open(CONFIG_PATH, "r", encoding="utf-8") as fh:
+            return fh.read()
+    except OSError as exc:
+        print("WARNING: could not read {} for change-records: {}"
+              .format(CONFIG_PATH, exc), file=sys.stderr)
+        return None
+
+
+def _drift_change_record(config_text, service, trash_id):
+    """
+    Build a single "drift" change-record per the shared contract:
+
+        {"type": "drift", "label": "drift",
+         "key": <trash_id>, "service": <service>,
+         "branch": "recyclarr/drift/<service>-<trash_id>",
+         "title": ..., "body": <markdown>,
+         "new_config": <FULL recyclarr.yml with ONLY this id removed>,
+         "confidence": null, "uncertain": false}
+
+    new_config is produced by recyclarr_patch.remove_trash_id (a no-op-safe,
+    comment-preserving round-trip edit). Returns None if the patcher is
+    unavailable or the edit raises -- a single un-patchable id must not abort the
+    whole change list.
+    """
+    try:
+        new_config = recyclarr_patch.remove_trash_id(config_text, service, trash_id)
+    except Exception as exc:  # noqa: BLE001 -- one bad id must not sink the batch.
+        print("WARNING: could not build drift patch for {} {}: {}"
+              .format(service, trash_id, exc), file=sys.stderr)
+        return None
+
+    docs_url = TRASH_CF_DOCS.get(service, "https://trash-guides.info/")
+    service_title = service.capitalize()
+    title = "drift: remove stale {} trash_id {}".format(service_title, trash_id)
+    body = (
+        "The custom-format `trash_id` `{tid}` is referenced under **{svc}** in "
+        "`recyclarr.yml` but is **no longer present** in the upstream TRaSH Guides "
+        "custom-format list. Upstream most likely renamed or removed it; recyclarr "
+        "would warn/skip it on sync.\n"
+        "\n"
+        "This PR removes that single stale id from the config. If it was renamed "
+        "upstream, replace it with the new id from the guide rather than merging "
+        "this as-is.\n"
+        "\n"
+        "Source (TRaSH Guides {svc} custom formats): {url}".format(
+            tid=trash_id, svc=service_title, url=docs_url
+        )
+    )
+
+    return {
+        "type": "drift",
+        "label": "drift",
+        "key": trash_id,
+        "service": service,
+        "branch": "recyclarr/drift/{}-{}".format(service, _sanitize_branch_part(trash_id)),
+        "title": title,
+        "body": body,
+        "new_config": new_config,
+        "confidence": None,
+        "uncertain": False,
+    }
+
+
+def build_drift_changes(stale_sonarr, stale_radarr):
+    """
+    Build the list of "drift" change-records for every stale trash_id.
+
+    Returns [] when recyclarr.yml is absent (no text to patch) or the patcher is
+    unavailable -- drift detection (and drift_result.json) is unaffected, only the
+    PR-building side degrades. Each record is a single-change patch of the CURRENT
+    repo recyclarr.yml.
+    """
+    if recyclarr_patch is None:
+        return []
+    config_text = _read_config_text()
+    if config_text is None:
+        return []
+
+    changes = []
+    for service, stale in (("sonarr", stale_sonarr), ("radarr", stale_radarr)):
+        for trash_id in stale:
+            record = _drift_change_record(config_text, service, trash_id)
+            if record is not None:
+                changes.append(record)
+    return changes
+
+
+def build_feature_issues(new_props):
+    """
+    Build feature-issue records for new schema properties. These are NOT PRs:
+    a new schema prop has no value we can safely synthesize (the AI never invents
+    setting values), so the manager opens a labeled issue for human review.
+
+    Contract: {"key": <dotted schema path>, "title": ..., "body": <markdown>}.
+    """
+    issues = []
+    for prop in new_props:
+        title = "feature: new recyclarr schema property `{}`".format(prop)
+        body = (
+            "A new property appeared in the recyclarr config JSON schema since the "
+            "last snapshot:\n"
+            "\n"
+            "    {prop}\n"
+            "\n"
+            "New schema properties usually correspond to a new recyclarr config "
+            "feature worth reviewing for adoption. No change is proposed "
+            "automatically: a setting value can't be safely inferred from the "
+            "schema alone, so this is filed for manual review.\n"
+            "\n"
+            "Schema: {schema}\n"
+            "Config reference: {docs}".format(
+                prop=prop,
+                schema=SCHEMA_BASE + SCHEMA_ROOT,
+                docs=RECYCLARR_SCHEMA_DOCS,
+            )
+        )
+        issues.append({"key": prop, "title": title, "body": body})
+    return issues
+
+
+def write_changes(changes, feature_issues):
+    """
+    Write /tmp/drift_changes.json in the shared shape. Always called (even when
+    both lists are empty) so manage_prs.py can reconcile / close superseded PRs.
+    Internal write error -> exit 2 (consistent with the drift_result.json writer).
+    """
+    payload = {"changes": changes, "feature_issues": feature_issues}
+    try:
+        with open(CHANGES_PATH, "w", encoding="utf-8") as fh:
+            json.dump(payload, fh, indent=2)
+            fh.write("\n")
+    except OSError as exc:
+        print("ERROR: could not write {}: {}".format(CHANGES_PATH, exc),
+              file=sys.stderr)
+        sys.exit(2)
+
+
+# --------------------------------------------------------------------------- #
 # Main
 # --------------------------------------------------------------------------- #
 
@@ -465,6 +663,15 @@ def main():
               file=sys.stderr)
         sys.exit(2)
 
+    # ----- change-records + feature-issues (PR/issue manager input) --------- #
+    # Per-change granularity: one drift change-record per stale trash_id (each a
+    # full recyclarr.yml with ONLY that id removed) and one feature-issue per new
+    # schema property. Written even when empty so the manager can reconcile a
+    # now-clean state (e.g. close PRs whose drift has been resolved).
+    drift_changes = build_drift_changes(stale_sonarr, stale_radarr)
+    feature_issues = build_feature_issues(new_props)
+    write_changes(drift_changes, feature_issues)
+
     # ----- human summary ---------------------------------------------------- #
     print("")
     print("=== recyclarr drift check ===")
@@ -482,7 +689,10 @@ def main():
         print("  new schema props:")
         for prop in new_props:
             print("    " + prop)
+    print("drift change-records:   {}".format(len(drift_changes)))
+    print("feature issues:         {}".format(len(feature_issues)))
     print("result written to {}".format(RESULT_PATH))
+    print("changes written to {}".format(CHANGES_PATH))
 
     # Exit 0 always on normal completion; the workflow acts on drift_result.json.
     sys.exit(0)

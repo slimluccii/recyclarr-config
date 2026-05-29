@@ -6,7 +6,7 @@ My [Recyclarr](https://recyclarr.dev) configuration, plus a scheduled **drift ch
 
 This repo holds my `recyclarr.yml` and runs a scheduled GitHub Actions job that watches for *upstream* changes I should know about. It does **not** sync anything and does **not** need access to my Sonarr/Radarr instances — it only inspects the config in this repo against publicly available upstream data. The actual `recyclarr sync` still runs where it always has (my server / locally).
 
-Everything surfaces in **one persistent GitHub issue** labeled **`recyclarr-status`** — a standing dashboard with two sections (must-fix drift + advisory suggestions), updated in place on every run and never auto-closed.
+Every actionable finding becomes its **own pull request** — one self-contained, reviewable change per PR — using four labels: **`drift`**, **`suggestion`**, **`settings`**, and **`feature`**. A change I can apply as a single edit to `recyclarr.yml` opens a PR I can merge or close; a change I *can't* express as a patch (a brand-new schema property) opens a labeled **issue** as a heads-up instead.
 
 ## Repo layout
 
@@ -16,7 +16,8 @@ Everything surfaces in **one persistent GitHub issue** labeled **`recyclarr-stat
 ├── scripts/
 │   ├── check_drift.py            # drift detection (stale trash_ids + new schema props)
 │   ├── suggest_cfs.py            # AI custom-format suggestions (gated ~once/day)
-│   └── build_status_issue.py     # assembles the status-issue body
+│   ├── recyclarr_patch.py        # round-trip YAML editor (one surgical edit per PR)
+│   └── manage_prs.py             # opens/updates/auto-closes per-change PRs + feature issues
 ├── schema-snapshot.json          # last-seen Recyclarr config schema (auto-committed)
 ├── suggestions.json              # last AI suggestion set (auto-committed)
 ├── tests/                        # pytest unit tests (no network)
@@ -42,17 +43,35 @@ Everything surfaces in **one persistent GitHub issue** labeled **`recyclarr-stat
 
 Infers your intent from the quality profiles + custom formats already in
 `recyclarr.yml`, then asks Claude (Haiku 4.5) which guide CFs you're *not* syncing
-would suit that setup — each with a rationale and confidence, ranked. **The AI
-never invents or applies scores** (scores always come from the guide on opt-in);
-it only judges *fit*. Suggestions are advisory — nothing is ever applied to your
-config automatically.
+would suit that setup — each with a rationale and confidence. **The AI never
+invents or applies scores** (scores always come from the guide on opt-in); it only
+judges *fit*, and the IDs it suggests come strictly from the guide's CF list (it
+never invents a `trash_id`). Each fit becomes a suggestion PR (see below).
 
-### Status issue
+### Per-change PRs
 
-- All findings roll up into **one** issue labeled `recyclarr-status`, created once
-  and edited in place. It is **never auto-closed** — it's a standing dashboard.
-- Section 1 = must-fix drift (or "✅ No drift detected"). Section 2 = ranked
-  suggestions (or a prompt to add a config).
+Every actionable finding is turned into **its own pull request**, built by applying
+exactly one surgical edit to the current `recyclarr.yml` via the round-trip editor
+(`scripts/recyclarr_patch.py`), so the diff is a single change with all your
+comments and `!env_var` lines preserved. `scripts/manage_prs.py` reconciles these
+on every run:
+
+- **`drift`** — removes a stale `trash_id` (gone upstream) or adjusts to match.
+- **`suggestion`** — adds a guide CF the AI judged a fit. A suggestion PR **always
+  opens with a best-guess `assign_scores_to` profile**, and when the AI isn't
+  confident the PR is **flagged as uncertain** so you know to double-check the
+  profile before merging. **No score is ever written** — `assign_scores_to` carries
+  only the profile name; scores come from the guide on opt-in.
+- **`settings`** — sets a config value at a dotted path to align with a recyclarr
+  template (values come only from those templates, never invented).
+- **`feature`** — a brand-new schema property that can't be expressed as a patch.
+  This opens a labeled **issue** (a heads-up to review for adoption), not a PR.
+
+**Stable branches + auto-close.** Each change uses a stable branch
+(`recyclarr/<type>/<key>`), so a finding maps to the *same* PR run after run rather
+than spawning duplicates. When a finding is **no longer relevant** (e.g. the stale
+id is gone, or the suggestion now matches your config), its PR is **closed
+automatically**.
 
 ### Auto-committed state (alert-once)
 
@@ -123,8 +142,15 @@ The workflow uses the built-in `GITHUB_TOKEN` — no PAT needed. It requests:
 
 ```yaml
 permissions:
-  contents: write   # commit updated schema-snapshot.json + suggestions.json
-  issues: write     # create / update the persistent recyclarr-status issue
+  contents: write        # commit schema-snapshot.json + suggestions.json; push change branches
+  pull-requests: write   # open / update / auto-close the per-change PRs
+  issues: write          # open / update the `feature` heads-up issues
 ```
+
+**Required repo setting.** Because the workflow opens PRs with the built-in token,
+you must enable **Settings → Actions → General → Workflow permissions → "Allow
+GitHub Actions to create and approve pull requests."** Without it, GitHub blocks the
+PR-creation step and the `drift` / `suggestion` / `settings` PRs never appear (the
+drift check itself still runs).
 
 The only external secret is `ANTHROPIC_API_KEY` (see Environment variables above).

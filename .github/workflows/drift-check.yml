@@ -19,27 +19,37 @@ on:
       - ".github/workflows/drift-check.yml"
 
 # Least privilege: only what this job needs. Everything else defaults to none.
+# The per-change flow opens/updates PRs and (for unpatchable schema features)
+# labeled issues, and still commits the snapshot + suggestions baselines back.
 permissions:
-  contents: write   # commit & push schema-snapshot.json + suggestions.json back
-  issues: write     # create / edit the persistent status issue (never close it)
+  contents: write        # commit & push schema-snapshot.json + suggestions.json,
+                         #   and create the per-change PR branches
+  pull-requests: write   # open / update / close the per-change PRs (manage_prs.py)
+  issues: write          # open / update the feature issues for unpatchable schema props
 
 jobs:
   drift:
     runs-on: ubuntu-latest
     steps:
+      # fetch-depth: 0 so manage_prs.py can create/switch/diff per-change branches
+      # and compare them against main. A shallow clone would break branch work.
       - name: Checkout
         uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
 
       - name: Set up Python
         uses: actions/setup-python@v6
         with:
           python-version: "3.x"
 
-      # pyyaml: parse recyclarr.yml (shared by check_drift + suggest_cfs).
+      # pyyaml: parse recyclarr.yml read-only (shared by check_drift + suggest_cfs).
+      # ruamel.yaml: round-trip editor used by recyclarr_patch.py to build per-change
+      # PR configs while preserving comments, formatting, and the !env_var tag.
       # anthropic: official SDK for the daily suggestion call (used only when the
       # AI step actually runs; installing it unconditionally keeps the env simple).
       - name: Install Python dependencies
-        run: pip install pyyaml anthropic
+        run: pip install pyyaml ruamel.yaml anthropic
 
       # Capture recyclarr `list` output via docker. `list custom-formats` only
       # reads TRaSH guide data over the network -- it does NOT connect to
@@ -57,9 +67,12 @@ jobs:
           docker run --rm "$IMAGE" list custom-formats sonarr --raw > /tmp/cf_sonarr.txt
           docker run --rm "$IMAGE" list custom-formats radarr --raw > /tmp/cf_radarr.txt
 
-      # check_drift.py reads /tmp/cf_sonarr.txt and /tmp/cf_radarr.txt, writes
-      # /tmp/drift_result.json ({"has_drift": bool, "issue_body": "..."}), and
-      # refreshes schema-snapshot.json in the working tree.
+      # check_drift.py reads /tmp/cf_sonarr.txt + /tmp/cf_radarr.txt and writes:
+      #   - /tmp/drift_result.json   (existing shape: has_drift + stale lists + body)
+      #   - /tmp/drift_changes.json  ({"changes":[...drift...], "feature_issues":[...]})
+      #       one change-record per stale trash_id (each becomes a PR), plus one
+      #       feature-issue record per new, unpatchable schema property.
+      # It also refreshes schema-snapshot.json in the working tree (committed below).
       - name: Check for drift
         run: |
           set -eo pipefail
@@ -68,13 +81,20 @@ jobs:
       # AI suggestion step -- GATED to run roughly once per day to keep cost and
       # API usage minimal (decision O2: a single combined call covers both
       # services). It runs when the current UTC hour is 06, OR on any manual
-      # workflow_dispatch (so an operator can force a refresh on demand). On the
-      # other 3h ticks it is skipped entirely and the previously committed
-      # suggestions.json is reused by the issue assembler below.
+      # workflow_dispatch / push (so an operator or a fresh commit forces a refresh).
+      # On the other 3h ticks it is skipped entirely and the previously committed
+      # suggestions.json is reused.
       #
       # suggest_cfs.py is responsible for the O1 cost optimization itself: it
       # skips the Anthropic call when recyclarr.yml's hash AND the guide-catalog
       # hash are both unchanged since suggestions.json was generated.
+      #
+      # It writes BOTH suggestions.json (committed back, for the O1 hash skip) and
+      # /tmp/ai_changes.json ({"changes":[...suggestion+settings...]}), one change
+      # per suggestion (each becomes a PR with a best-guess assign_profile).
+      #
+      # IMPORTANT: when this step is SKIPPED we still write an empty
+      # /tmp/ai_changes.json so manage_prs.py below always has a file to read.
       - name: Refresh AI custom-format suggestions
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
@@ -88,87 +108,65 @@ jobs:
           #     immediately; the script's O1 hash check skips the actual API call if
           #     nothing relevant changed, so this is free when it's a no-op push)
           #   - the 06:00 scheduled tick (daily refresh)
-          # Every other 3h scheduled tick exits early and the committed
-          # suggestions.json is reused by the issue assembler below.
+          # Every other 3h scheduled tick exits early. In that case we MUST still
+          # leave a well-formed /tmp/ai_changes.json so manage_prs.py has a file to
+          # read; we write an empty change set here before exiting.
           HOUR_UTC="$(date -u +%H)"
           EVENT="${{ github.event_name }}"
           if [ "$EVENT" != "workflow_dispatch" ] && [ "$EVENT" != "push" ] && [ "$HOUR_UTC" != "06" ]; then
             echo "Scheduled tick at UTC hour $HOUR_UTC (not 06) and not manual/push; skipping AI suggestion refresh."
+            # evaluated:false tells manage_prs.py NOT to reconcile (close) the
+            # suggestion/settings PRs this tick -- they weren't re-evaluated, so
+            # an empty change set here must not be read as "no longer relevant".
+            echo '{"changes":[],"evaluated":false}' > /tmp/ai_changes.json
             exit 0
           fi
 
           # suggest_cfs.py reads recyclarr.yml + /tmp/cf_*.txt, performs its own
-          # unchanged-hash short-circuit (O1), and writes suggestions.json. It
-          # NEVER outputs or applies scores.
+          # unchanged-hash short-circuit (O1), and writes suggestions.json plus
+          # /tmp/ai_changes.json. It NEVER outputs or applies scores.
           python scripts/suggest_cfs.py
 
-      # Assemble the full status-issue body from the two persisted parts
-      # (/tmp/drift_result.json refreshed every run + suggestions.json refreshed
-      # daily) and upsert a SINGLE always-open status issue. The issue is never
-      # closed -- it is the standing dashboard for drift + suggestions.
-      - name: Upsert status issue
+      # Reconcile per-change PRs + feature issues. manage_prs.py reads BOTH
+      # /tmp/drift_changes.json and /tmp/ai_changes.json and, for each change
+      # record, creates/updates a branch (recyclarr/<type>/<key>) carrying that
+      # single change applied to recyclarr.yml, opens or updates the matching PR,
+      # closes PRs whose change no longer applies, and upserts the feature issues.
+      # It uses the gh CLI (GH_TOKEN) for all PR/issue operations.
+      #
+      # We set the bot git identity BEFORE running it so any branch commits it
+      # makes are attributed to github-actions[bot].
+      - name: Reconcile per-change PRs and feature issues
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -eo pipefail
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          # Ensure the status label exists (idempotent; never fail the job on it).
-          gh label create recyclarr-status \
-            --color 0E8A16 \
-            --description "Recyclarr drift + suggestions status" \
-            --force || true
-
-          # Build the markdown body. build_status_issue.py reads the drift result
-          # and suggestions.json and prints the assembled body to stdout.
-          python scripts/build_status_issue.py > /tmp/status_body.md
-
-          # Find the open status issue by label, or empty string if none.
-          STATUS_ISSUE="$(gh issue list \
-            --label recyclarr-status \
-            --state open \
-            --limit 1 \
-            --json number \
-            --jq '.[0].number // empty')"
-
-          if [ -z "$STATUS_ISSUE" ]; then
-            gh issue create \
-              --title "Recyclarr status" \
-              --label recyclarr-status \
-              --body-file /tmp/status_body.md
-          else
-            # Edit in place -- never close. Title is kept stable.
-            gh issue edit "$STATUS_ISSUE" \
-              --title "Recyclarr status" \
-              --body-file /tmp/status_body.md
-          fi
-
-          # One-time migration: the previous design used a transient
-          # `recyclarr-drift` issue that was auto-closed when drift cleared. That
-          # behavior is gone. If such an issue is still open from earlier runs,
-          # close it once with a pointer to the new persistent status issue.
-          OLD_DRIFT_ISSUE="$(gh issue list \
-            --label recyclarr-drift \
-            --state open \
-            --limit 1 \
-            --json number \
-            --jq '.[0].number // empty')"
-
-          if [ -n "$OLD_DRIFT_ISSUE" ]; then
-            gh issue close "$OLD_DRIFT_ISSUE" \
-              --comment "Superseded by the persistent Recyclarr status issue. Drift and suggestions now live there and that issue stays open." \
-              --reason completed || true
-          fi
+          python scripts/manage_prs.py
 
       # Commit back any changed schema-snapshot.json AND suggestions.json in a
       # single commit so the next run's comparisons (schema diff + O1 hash skip)
       # stay correct. Both files may not exist on a given run (e.g. schema fetch
       # failed, or the AI step was skipped on first ever run), so each `git add`
       # is guarded. We only commit/push when there is an actual staged diff.
+      #
+      # ORDERING: manage_prs.py switches branches while building per-change PRs.
+      # It is responsible for leaving the working tree back on `main` and clean
+      # when it finishes. We defensively re-checkout main here so this commit-back
+      # always lands on main even if manage_prs left HEAD elsewhere, then re-add
+      # the baseline files from the working tree (which check_drift/suggest_cfs
+      # wrote on main before any branch switching happened).
       - name: Commit updated snapshot and suggestions
         run: |
           set -eo pipefail
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          # Defensive: ensure we commit onto main regardless of where manage_prs.py
+          # left HEAD. -- main is the long-lived branch the baselines belong to.
+          git checkout main
 
           if [ -f schema-snapshot.json ]; then
             git add schema-snapshot.json
@@ -183,4 +181,3 @@ jobs:
             git commit -m "chore: update recyclarr schema snapshot + suggestions [skip ci]"
             git push
           fi
-
