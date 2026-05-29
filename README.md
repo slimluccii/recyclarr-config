@@ -1,12 +1,12 @@
 # recyclarr-config
 
-My [Recyclarr](https://recyclarr.dev) configuration, plus a daily **drift check** that tells me when my config has fallen out of sync with upstream — the [TRaSH Guides](https://trash-guides.info) and Recyclarr's own config schema.
+My [Recyclarr](https://recyclarr.dev) configuration, plus a scheduled **drift check** and **AI custom-format suggestions** that keep me in sync with upstream — the [TRaSH Guides](https://trash-guides.info) and Recyclarr's own config schema.
 
 ## What this repo is
 
 This repo holds my `recyclarr.yml` and runs a scheduled GitHub Actions job that watches for *upstream* changes I should know about. It does **not** sync anything and does **not** need access to my Sonarr/Radarr instances — it only inspects the config in this repo against publicly available upstream data. The actual `recyclarr sync` still runs where it always has (my server / locally).
 
-When drift is detected, the workflow opens a single GitHub issue tagged **`recyclarr-drift`**. When everything is back in sync, it closes that issue automatically.
+Everything surfaces in **one persistent GitHub issue** labeled **`recyclarr-status`** — a standing dashboard with two sections (must-fix drift + advisory suggestions), updated in place on every run and never auto-closed.
 
 ## Repo layout
 
@@ -14,43 +14,62 @@ When drift is detected, the workflow opens a single GitHub issue tagged **`recyc
 .
 ├── recyclarr.yml                 # config (root) — starts as a template, replace with yours
 ├── scripts/
-│   └── check_drift.py            # the drift-check logic
+│   ├── check_drift.py            # drift detection (stale trash_ids + new schema props)
+│   ├── suggest_cfs.py            # AI custom-format suggestions (gated ~once/day)
+│   └── build_status_issue.py     # assembles the status-issue body
 ├── schema-snapshot.json          # last-seen Recyclarr config schema (auto-committed)
+├── suggestions.json              # last AI suggestion set (auto-committed)
+├── tests/                        # pytest unit tests (no network)
 └── .github/
     └── workflows/
-        └── drift-check.yml        # daily scheduled workflow
+        └── drift-check.yml        # scheduled workflow
 ```
 
-## How the daily check works
+## What it checks
 
-`scripts/check_drift.py` runs two independent checks:
+**Drift** — `scripts/check_drift.py`, every run:
 
-1. **Stale `trash_ids`** — every `trash_id` referenced in `recyclarr.yml` is validated
-   against the current TRaSH Guides custom-format list (pulled via
-   `recyclarr list custom-formats <service> --raw` in the official Docker image,
-   no Sonarr/Radarr connection). IDs that no longer exist upstream (renamed,
-   removed, restructured) are flagged.
-2. **New schema properties** — fetches Recyclarr's current config JSON schema
-   (the multi-file `$ref` tree at `schemas.recyclarr.dev/latest`) and diffs the
-   set of property paths against `schema-snapshot.json`. New properties usually
-   mean new recyclarr config features worth adopting.
+1. **Stale `trash_ids`** — every `trash_id` in `recyclarr.yml` is validated against
+   the current TRaSH Guides custom-format list (`recyclarr list custom-formats
+   <service> --raw` in the official Docker image, no Sonarr/Radarr connection).
+   IDs that no longer exist upstream are flagged.
+2. **New schema properties** — fetches Recyclarr's config JSON schema (the
+   multi-file `$ref` tree at `schemas.recyclarr.dev/latest`) and diffs the property
+   paths against `schema-snapshot.json`. New properties usually mean new config
+   features worth adopting.
 
-### Auto-issue lifecycle
+**Suggestions** — `scripts/suggest_cfs.py`, gated to ~once/day:
 
-- All findings roll up into **one** issue labeled `recyclarr-drift`.
-- If an issue is already open, it's updated in place rather than duplicated.
-- When a run finds **no** drift, any open `recyclarr-drift` issue is **closed automatically**. One issue, self-healing.
+Infers your intent from the quality profiles + custom formats already in
+`recyclarr.yml`, then asks Claude (Haiku 4.5) which guide CFs you're *not* syncing
+would suit that setup — each with a rationale and confidence, ranked. **The AI
+never invents or applies scores** (scores always come from the guide on opt-in);
+it only judges *fit*. Suggestions are advisory — nothing is ever applied to your
+config automatically.
 
-### Alert-once schema snapshot
+### Status issue
 
-After reporting a schema diff, the workflow **commits the updated `schema-snapshot.json` back to the repo**. That means each new schema property alerts exactly once — the next run compares against the new baseline and stays quiet until the *next* upstream change. (The first run just establishes the baseline and raises no alert.)
+- All findings roll up into **one** issue labeled `recyclarr-status`, created once
+  and edited in place. It is **never auto-closed** — it's a standing dashboard.
+- Section 1 = must-fix drift (or "✅ No drift detected"). Section 2 = ranked
+  suggestions (or a prompt to add a config).
+
+### Auto-committed state (alert-once)
+
+The workflow commits `schema-snapshot.json` and `suggestions.json` back to the repo
+when they change. So each new schema property alerts exactly once (next run
+compares against the new baseline), and unchanged config + catalog **skips the API
+call entirely** (suggestions are reused from the committed file).
 
 ## Schedule
 
-- **Every 3 hours** via `cron` (`0 */3 * * *`, UTC). The check is light — a docker
-  `list` and a ~15KB schema fetch — so frequent runs are cheap. Note: on a
-  **private** repo this consumes Actions minutes (~8 runs/day); public repos run free.
-- Plus a manual **"Run workflow"** button (`workflow_dispatch`) in the Actions tab.
+- **Every 3 hours** via `cron` (`0 */3 * * *`, UTC) for the drift check — light (a
+  docker `list` + a ~15KB schema fetch). On a **private** repo this consumes Actions
+  minutes (~8 runs/day); public repos run free.
+- The **AI suggestion step is gated to the 06:00 UTC tick** (≈1 API call/day) to keep
+  cost down; the other ticks reuse the committed `suggestions.json`.
+- A manual **"Run workflow"** button (`workflow_dispatch`) runs both, including a
+  fresh suggestion refresh on demand.
 
 ## Environment variables
 
@@ -73,14 +92,18 @@ radarr:
     api_key: !env_var RADARR_API_KEY
 ```
 
-**The CI never needs real secrets.** The drift check is upstream-only — it parses
-the config and queries TRaSH / the schema; it never connects to Sonarr or Radarr.
-The checker understands the `!env_var` tag and simply ignores the resolved value,
-so **no secrets (real or dummy) need to be set in GitHub at all**.
+**The CI never needs your Sonarr/Radarr secrets.** The checks are upstream-only —
+they parse the config and query TRaSH / the schema; they never connect to Sonarr or
+Radarr. The scripts understand the `!env_var` tag and ignore the resolved value, so
+**no `*arr` credentials (real or dummy) need to be set in GitHub at all**.
 
-Real values are only required where you actually run `recyclarr sync` — your
+Real `*arr` values are only required where you actually run `recyclarr sync` — your
 server or local machine — by exporting the matching environment variables there
 (`SONARR_URL`, `SONARR_API_KEY`, `RADARR_URL`, `RADARR_API_KEY`, etc.).
+
+The **one** secret CI does need is **`ANTHROPIC_API_KEY`** (repo → Settings →
+Secrets → Actions), used by the daily suggestion step. Without it, the drift check
+still runs fine; the suggestion step just logs a warning and skips.
 
 ## Getting started
 
@@ -100,6 +123,8 @@ The workflow uses the built-in `GITHUB_TOKEN` — no PAT needed. It requests:
 
 ```yaml
 permissions:
-  contents: write   # commit the updated schema-snapshot.json
-  issues: write     # open / update / close the recyclarr-drift issue
+  contents: write   # commit updated schema-snapshot.json + suggestions.json
+  issues: write     # create / update the persistent recyclarr-status issue
 ```
+
+The only external secret is `ANTHROPIC_API_KEY` (see Environment variables above).

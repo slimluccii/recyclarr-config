@@ -3,14 +3,15 @@ name: recyclarr drift check
 on:
   schedule:
     # Every 3 hours. GitHub cron is always UTC; there is no timezone field.
-    # The check is light (docker list + a ~15KB schema fetch), so this is cheap.
+    # The drift check is light (docker list + a ~15KB schema fetch), so it runs
+    # on every tick. The AI suggestion step is gated separately to ~1 call/day.
     - cron: "0 */3 * * *"
   workflow_dispatch: {}
 
 # Least privilege: only what this job needs. Everything else defaults to none.
 permissions:
-  contents: write   # commit & push schema-snapshot.json back
-  issues: write     # create / edit / close the drift issue
+  contents: write   # commit & push schema-snapshot.json + suggestions.json back
+  issues: write     # create / edit the persistent status issue (never close it)
 
 jobs:
   drift:
@@ -24,8 +25,11 @@ jobs:
         with:
           python-version: "3.x"
 
+      # pyyaml: parse recyclarr.yml (shared by check_drift + suggest_cfs).
+      # anthropic: official SDK for the daily suggestion call (used only when the
+      # AI step actually runs; installing it unconditionally keeps the env simple).
       - name: Install Python dependencies
-        run: pip install pyyaml
+        run: pip install pyyaml anthropic
 
       # Capture recyclarr `list` output via docker. `list custom-formats` only
       # reads TRaSH guide data over the network -- it does NOT connect to
@@ -33,7 +37,8 @@ jobs:
       # (mounting a config with !env_var secrets could trigger a parse failure).
       # `--raw` emits stable TSV (trash_id<TAB>name<TAB>category); recyclarr writes
       # the list to stdout and diagnostics to stderr, so the file stays clean.
-      # Image is pinned to the :8 major tag -- :latest is no longer published.
+      # These files feed BOTH check_drift.py (staleness) and suggest_cfs.py
+      # (candidate catalog). Image is pinned to the :8 major tag.
       - name: Dump recyclarr custom formats
         run: |
           set -eo pipefail
@@ -44,65 +49,107 @@ jobs:
 
       # check_drift.py reads /tmp/cf_sonarr.txt and /tmp/cf_radarr.txt, writes
       # /tmp/drift_result.json ({"has_drift": bool, "issue_body": "..."}), and
-      # updates schema-snapshot.json in the working tree.
+      # refreshes schema-snapshot.json in the working tree.
       - name: Check for drift
         run: |
           set -eo pipefail
           python scripts/check_drift.py
 
-      - name: Manage drift issue
+      # AI suggestion step -- GATED to run roughly once per day to keep cost and
+      # API usage minimal (decision O2: a single combined call covers both
+      # services). It runs when the current UTC hour is 06, OR on any manual
+      # workflow_dispatch (so an operator can force a refresh on demand). On the
+      # other 3h ticks it is skipped entirely and the previously committed
+      # suggestions.json is reused by the issue assembler below.
+      #
+      # suggest_cfs.py is responsible for the O1 cost optimization itself: it
+      # skips the Anthropic call when recyclarr.yml's hash AND the guide-catalog
+      # hash are both unchanged since suggestions.json was generated.
+      - name: Refresh AI custom-format suggestions
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          set -eo pipefail
+
+          # Time-of-day gate (UTC). GitHub Actions has no UTC-hour expression for a
+          # step-level `if:`, so the whole gate lives here in shell: run on any
+          # manual workflow_dispatch, or on the 06:00 scheduled tick. Every other
+          # 3h tick exits early and the previously committed suggestions.json is
+          # reused by the issue assembler below.
+          HOUR_UTC="$(date -u +%H)"
+          if [ "${{ github.event_name }}" != "workflow_dispatch" ] && [ "$HOUR_UTC" != "06" ]; then
+            echo "UTC hour is $HOUR_UTC and not a manual run; skipping AI suggestion refresh."
+            exit 0
+          fi
+
+          # suggest_cfs.py reads recyclarr.yml + /tmp/cf_*.txt, performs its own
+          # unchanged-hash short-circuit (O1), and writes suggestions.json. It
+          # NEVER outputs or applies scores.
+          python scripts/suggest_cfs.py
+
+      # Assemble the full status-issue body from the two persisted parts
+      # (/tmp/drift_result.json refreshed every run + suggestions.json refreshed
+      # daily) and upsert a SINGLE always-open status issue. The issue is never
+      # closed -- it is the standing dashboard for drift + suggestions.
+      - name: Upsert status issue
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -eo pipefail
 
-          # Ensure the label exists (idempotent upsert; never fail the job on it).
-          gh label create recyclarr-drift \
-            --color B60205 \
-            --description "Recyclarr config drift" \
+          # Ensure the status label exists (idempotent; never fail the job on it).
+          gh label create recyclarr-status \
+            --color 0E8A16 \
+            --description "Recyclarr drift + suggestions status" \
             --force || true
 
-          HAS_DRIFT="$(jq -r '.has_drift' /tmp/drift_result.json)"
+          # Build the markdown body. build_status_issue.py reads the drift result
+          # and suggestions.json and prints the assembled body to stdout.
+          python scripts/build_status_issue.py > /tmp/status_body.md
 
-          # Body driven by a file so multiline markdown stays clean.
-          jq -r '.issue_body // ""' /tmp/drift_result.json > /tmp/issue_body.md
+          # Find the open status issue by label, or empty string if none.
+          STATUS_ISSUE="$(gh issue list \
+            --label recyclarr-status \
+            --state open \
+            --limit 1 \
+            --json number \
+            --jq '.[0].number // empty')"
 
-          # Find the open drift issue, or empty string if none.
-          ISSUE_NUMBER="$(gh issue list \
+          if [ -z "$STATUS_ISSUE" ]; then
+            gh issue create \
+              --title "Recyclarr status" \
+              --label recyclarr-status \
+              --body-file /tmp/status_body.md
+          else
+            # Edit in place -- never close. Title is kept stable.
+            gh issue edit "$STATUS_ISSUE" \
+              --title "Recyclarr status" \
+              --body-file /tmp/status_body.md
+          fi
+
+          # One-time migration: the previous design used a transient
+          # `recyclarr-drift` issue that was auto-closed when drift cleared. That
+          # behavior is gone. If such an issue is still open from earlier runs,
+          # close it once with a pointer to the new persistent status issue.
+          OLD_DRIFT_ISSUE="$(gh issue list \
             --label recyclarr-drift \
             --state open \
             --limit 1 \
             --json number \
             --jq '.[0].number // empty')"
 
-          if [ "$HAS_DRIFT" = "true" ]; then
-            TITLE="Recyclarr config drift detected"
-            if [ -z "$ISSUE_NUMBER" ]; then
-              gh issue create \
-                --title "$TITLE" \
-                --label recyclarr-drift \
-                --body-file /tmp/issue_body.md
-            else
-              gh issue edit "$ISSUE_NUMBER" \
-                --title "$TITLE" \
-                --body-file /tmp/issue_body.md
-            fi
-          else
-            # Drift resolved: close the open issue if one exists. The guard means
-            # the empty/closed-issue case does not fail the job.
-            if [ -n "$ISSUE_NUMBER" ]; then
-              gh issue close "$ISSUE_NUMBER" \
-                --comment "Drift resolved ✅" \
-                --reason completed
-            else
-              echo "No open drift issue and no drift. Nothing to do."
-            fi
+          if [ -n "$OLD_DRIFT_ISSUE" ]; then
+            gh issue close "$OLD_DRIFT_ISSUE" \
+              --comment "Superseded by the persistent Recyclarr status issue. Drift and suggestions now live there and that issue stays open." \
+              --reason completed || true
           fi
 
-      # Always commit the latest observed snapshot so the next run's comparison
-      # is correct. Only commits when the file actually changed. The default
-      # GITHUB_TOKEN can push to the same repo with `contents: write`.
-      - name: Commit updated snapshot
+      # Commit back any changed schema-snapshot.json AND suggestions.json in a
+      # single commit so the next run's comparisons (schema diff + O1 hash skip)
+      # stay correct. Both files may not exist on a given run (e.g. schema fetch
+      # failed, or the AI step was skipped on first ever run), so each `git add`
+      # is guarded. We only commit/push when there is an actual staged diff.
+      - name: Commit updated snapshot and suggestions
         run: |
           set -eo pipefail
           git config user.name  "github-actions[bot]"
@@ -111,10 +158,13 @@ jobs:
           if [ -f schema-snapshot.json ]; then
             git add schema-snapshot.json
           fi
+          if [ -f suggestions.json ]; then
+            git add suggestions.json
+          fi
 
           if git diff --staged --quiet; then
-            echo "No snapshot changes."
+            echo "No snapshot or suggestion changes."
           else
-            git commit -m "chore: update recyclarr schema snapshot [skip ci]"
+            git commit -m "chore: update recyclarr schema snapshot + suggestions [skip ci]"
             git push
           fi
