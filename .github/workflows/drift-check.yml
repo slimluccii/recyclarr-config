@@ -183,3 +183,4 @@ jobs:
             git commit -m "chore: update recyclarr schema snapshot + suggestions [skip ci]"
             git push
           fi
+
