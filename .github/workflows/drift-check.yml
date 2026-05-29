@@ -1,0 +1,119 @@
+name: recyclarr drift check
+
+on:
+  schedule:
+    # 06:00 UTC daily. GitHub cron is always UTC; there is no timezone field.
+    - cron: "0 6 * * *"
+  workflow_dispatch: {}
+
+# Least privilege: only what this job needs. Everything else defaults to none.
+permissions:
+  contents: write   # commit & push schema-snapshot.json back
+  issues: write     # create / edit / close the drift issue
+
+jobs:
+  drift:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: Install Python dependencies
+        run: pip install pyyaml
+
+      # Capture recyclarr `list` output via docker. `list custom-formats` only
+      # reads TRaSH guide data over the network -- it does NOT connect to
+      # Sonarr/Radarr and does NOT require a config file, so no volume is mounted
+      # (mounting a config with !env_var secrets could trigger a parse failure).
+      # `--raw` emits stable TSV (trash_id<TAB>name<TAB>category); recyclarr writes
+      # the list to stdout and diagnostics to stderr, so the file stays clean.
+      # Image is pinned to the :8 major tag -- :latest is no longer published.
+      - name: Dump recyclarr custom formats
+        run: |
+          set -eo pipefail
+          IMAGE="ghcr.io/recyclarr/recyclarr:8"
+
+          docker run --rm "$IMAGE" list custom-formats sonarr --raw > /tmp/cf_sonarr.txt
+          docker run --rm "$IMAGE" list custom-formats radarr --raw > /tmp/cf_radarr.txt
+
+      # check_drift.py reads /tmp/cf_sonarr.txt and /tmp/cf_radarr.txt, writes
+      # /tmp/drift_result.json ({"has_drift": bool, "issue_body": "..."}), and
+      # updates schema-snapshot.json in the working tree.
+      - name: Check for drift
+        run: |
+          set -eo pipefail
+          python scripts/check_drift.py
+
+      - name: Manage drift issue
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -eo pipefail
+
+          # Ensure the label exists (idempotent upsert; never fail the job on it).
+          gh label create recyclarr-drift \
+            --color B60205 \
+            --description "Recyclarr config drift" \
+            --force || true
+
+          HAS_DRIFT="$(jq -r '.has_drift' /tmp/drift_result.json)"
+
+          # Body driven by a file so multiline markdown stays clean.
+          jq -r '.issue_body // ""' /tmp/drift_result.json > /tmp/issue_body.md
+
+          # Find the open drift issue, or empty string if none.
+          ISSUE_NUMBER="$(gh issue list \
+            --label recyclarr-drift \
+            --state open \
+            --limit 1 \
+            --json number \
+            --jq '.[0].number // empty')"
+
+          if [ "$HAS_DRIFT" = "true" ]; then
+            TITLE="Recyclarr config drift detected"
+            if [ -z "$ISSUE_NUMBER" ]; then
+              gh issue create \
+                --title "$TITLE" \
+                --label recyclarr-drift \
+                --body-file /tmp/issue_body.md
+            else
+              gh issue edit "$ISSUE_NUMBER" \
+                --title "$TITLE" \
+                --body-file /tmp/issue_body.md
+            fi
+          else
+            # Drift resolved: close the open issue if one exists. The guard means
+            # the empty/closed-issue case does not fail the job.
+            if [ -n "$ISSUE_NUMBER" ]; then
+              gh issue close "$ISSUE_NUMBER" \
+                --comment "Drift resolved ✅" \
+                --reason completed
+            else
+              echo "No open drift issue and no drift. Nothing to do."
+            fi
+          fi
+
+      # Always commit the latest observed snapshot so the next run's comparison
+      # is correct. Only commits when the file actually changed. The default
+      # GITHUB_TOKEN can push to the same repo with `contents: write`.
+      - name: Commit updated snapshot
+        run: |
+          set -eo pipefail
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          if [ -f schema-snapshot.json ]; then
+            git add schema-snapshot.json
+          fi
+
+          if git diff --staged --quiet; then
+            echo "No snapshot changes."
+          else
+            git commit -m "chore: update recyclarr schema snapshot [skip ci]"
+            git push
+          fi
