@@ -16,6 +16,12 @@ sonarr:
     base_url: !env_var SONARR_URL
     api_key: !env_var SONARR_API_KEY
 
+    # TEMP end-to-end test: this trash_id does not exist upstream, so the drift
+    # check should flag it stale and open a `drift` PR to remove it. Reverted after.
+    custom_formats:
+      - trash_ids:
+          - deadbeefdeadbeefdeadbeefdeadbeef
+
     # quality_definition:
     #   type: series
 
