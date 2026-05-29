@@ -7,6 +7,16 @@ on:
     # on every tick. The AI suggestion step is gated separately to ~1 call/day.
     - cron: "0 */3 * * *"
   workflow_dispatch: {}
+  push:
+    branches: [main]
+    # PR merges land here as a push, so this covers both. The bot's own
+    # commit-back uses [skip ci] AND pushes made with GITHUB_TOKEN never
+    # re-trigger workflows, so there is no run loop. Path filter keeps doc-only
+    # edits from spending a run.
+    paths:
+      - "recyclarr.yml"
+      - "scripts/**"
+      - ".github/workflows/drift-check.yml"
 
 # Least privilege: only what this job needs. Everything else defaults to none.
 permissions:
@@ -71,14 +81,19 @@ jobs:
         run: |
           set -eo pipefail
 
-          # Time-of-day gate (UTC). GitHub Actions has no UTC-hour expression for a
-          # step-level `if:`, so the whole gate lives here in shell: run on any
-          # manual workflow_dispatch, or on the 06:00 scheduled tick. Every other
-          # 3h tick exits early and the previously committed suggestions.json is
-          # reused by the issue assembler below.
+          # Gate (UTC). GitHub Actions has no UTC-hour expression for a step-level
+          # `if:`, so the whole gate lives here in shell. Run the suggestion step on:
+          #   - workflow_dispatch (manual force-refresh)
+          #   - push (e.g. you committed a new recyclarr.yml — get fresh suggestions
+          #     immediately; the script's O1 hash check skips the actual API call if
+          #     nothing relevant changed, so this is free when it's a no-op push)
+          #   - the 06:00 scheduled tick (daily refresh)
+          # Every other 3h scheduled tick exits early and the committed
+          # suggestions.json is reused by the issue assembler below.
           HOUR_UTC="$(date -u +%H)"
-          if [ "${{ github.event_name }}" != "workflow_dispatch" ] && [ "$HOUR_UTC" != "06" ]; then
-            echo "UTC hour is $HOUR_UTC and not a manual run; skipping AI suggestion refresh."
+          EVENT="${{ github.event_name }}"
+          if [ "$EVENT" != "workflow_dispatch" ] && [ "$EVENT" != "push" ] && [ "$HOUR_UTC" != "06" ]; then
+            echo "Scheduled tick at UTC hour $HOUR_UTC (not 06) and not manual/push; skipping AI suggestion refresh."
             exit 0
           fi
 
