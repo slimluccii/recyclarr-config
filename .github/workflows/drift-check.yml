@@ -38,18 +38,54 @@ jobs:
         with:
           fetch-depth: 0
 
+      # cache: pip + cache-dependency-path keys the pip download cache on the hash
+      # of requirements.txt -- change a dependency and it reinstalls; otherwise the
+      # wheels are restored from cache and `pip install` is near-instant.
       - name: Set up Python
         uses: actions/setup-python@v6
         with:
           python-version: "3.x"
+          cache: pip
+          cache-dependency-path: requirements.txt
 
-      # pyyaml: parse recyclarr.yml read-only (shared by check_drift + suggest_cfs).
-      # ruamel.yaml: round-trip editor used by recyclarr_patch.py to build per-change
-      # PR configs while preserving comments, formatting, and the !env_var tag.
-      # anthropic: official SDK for the daily suggestion call (used only when the
-      # AI step actually runs; installing it unconditionally keeps the env simple).
+      # Dependencies are declared in requirements.txt (pyyaml, ruamel.yaml,
+      # anthropic) so the cache key above can hash them.
       - name: Install Python dependencies
-        run: pip install pyyaml ruamel.yaml anthropic
+        run: pip install -r requirements.txt
+
+      # --- Cache the recyclarr docker image, keyed on its LIVE digest ----------
+      # We resolve the current digest of the :8 tag (a tiny manifest metadata call,
+      # not the image layers). When recyclarr publishes a new :8 image the digest
+      # changes -> cache miss -> we pull fresh. When unchanged -> cache hit -> we
+      # `docker load` the saved tar and skip the pull entirely. This keeps us on the
+      # current image while avoiding a redundant pull on most runs.
+      - name: Resolve recyclarr image digest
+        id: rcimg
+        run: |
+          set -eo pipefail
+          DIGEST="$(docker buildx imagetools inspect ghcr.io/recyclarr/recyclarr:8 \
+            | awk '/^Digest:/{print $2; exit}')"
+          echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
+          echo "recyclarr:8 digest = $DIGEST"
+
+      - name: Cache recyclarr image
+        id: rccache
+        uses: actions/cache@v4
+        with:
+          path: /tmp/recyclarr-image.tar
+          key: recyclarr-image-${{ steps.rcimg.outputs.digest }}
+
+      - name: Load or pull recyclarr image
+        run: |
+          set -eo pipefail
+          if [ -f /tmp/recyclarr-image.tar ]; then
+            echo "cache hit -> loading image from tar"
+            docker load -i /tmp/recyclarr-image.tar
+          else
+            echo "cache miss -> pulling current image"
+            docker pull ghcr.io/recyclarr/recyclarr:8
+            docker save ghcr.io/recyclarr/recyclarr:8 -o /tmp/recyclarr-image.tar
+          fi
 
       # Capture recyclarr `list` output via docker. `list custom-formats` only
       # reads TRaSH guide data over the network -- it does NOT connect to

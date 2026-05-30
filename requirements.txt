@@ -1,0 +1,7 @@
+# CI dependencies for the drift-check workflow.
+# pyyaml      - read-only parse of recyclarr.yml (check_drift + suggest_cfs)
+# ruamel.yaml - comment/!env_var-preserving round-trip editor (recyclarr_patch)
+# anthropic   - official SDK for the daily suggestion call (suggest_cfs)
+pyyaml
+ruamel.yaml
+anthropic
