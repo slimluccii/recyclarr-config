@@ -447,6 +447,24 @@ def _read_config_text():
         return None
 
 
+def _cf_name_from_config(config_text, trash_id):
+    """
+    Best-effort lookup of the human name a stale trash_id was annotated with in the
+    user's config, e.g. `- deadbeef...  # BR-DISK` -> "BR-DISK". The id is gone
+    upstream (that's why it's stale), so the only available name is the inline
+    comment the config author wrote. Returns the comment text, or "" if none.
+    """
+    if not config_text or not trash_id:
+        return ""
+    # Match a line containing the id followed by an inline `# comment`.
+    pattern = re.compile(
+        r"{}\s*#\s*(.+?)\s*$".format(re.escape(trash_id)),
+        re.IGNORECASE | re.MULTILINE,
+    )
+    m = pattern.search(config_text)
+    return m.group(1).strip() if m else ""
+
+
 def _drift_change_record(config_text, service, trash_id):
     """
     Build a single "drift" change-record per the shared contract:
@@ -472,21 +490,32 @@ def _drift_change_record(config_text, service, trash_id):
 
     docs_url = TRASH_CF_DOCS.get(service, "https://trash-guides.info/")
     service_title = service.capitalize()
-    title = "drift: remove stale {} trash_id {}".format(service_title, trash_id)
-    body = (
-        "The custom-format `trash_id` `{tid}` is referenced under **{svc}** in "
-        "`recyclarr.yml` but is **no longer present** in the upstream TRaSH Guides "
-        "custom-format list. Upstream most likely renamed or removed it; recyclarr "
-        "would warn/skip it on sync.\n"
-        "\n"
-        "This PR removes that single stale id from the config. If it was renamed "
-        "upstream, replace it with the new id from the guide rather than merging "
-        "this as-is.\n"
-        "\n"
-        "Source (TRaSH Guides {svc} custom formats): {url}".format(
-            tid=trash_id, svc=service_title, url=docs_url
-        )
-    )
+    name = _cf_name_from_config(config_text, trash_id) or "(unknown)"
+
+    title = "drift: remove stale {} CF {}".format(service_title, name)
+    body = "\n".join([
+        "## 🗑️ Remove stale custom format",
+        "",
+        "| | |",
+        "|---|---|",
+        "| **Name** | {} |".format(name),
+        "| **trash_id** | `{}` |".format(trash_id),
+        "| **Service** | {} |".format(service_title),
+        "",
+        "### Why",
+        "No longer present in the upstream TRaSH Guides custom-format list — "
+        "renamed or removed upstream. recyclarr would warn/skip it on sync.",
+        "",
+        "### What this PR does",
+        "Removes this one `trash_id` from `recyclarr.yml`.",
+        "",
+        "### Before merging",
+        "If it was **renamed** (not removed) upstream, replace it with the new id "
+        "from the guide instead of merging this as-is.",
+        "",
+        "### Source",
+        "[TRaSH Guides — {} custom formats]({})".format(service_title, docs_url),
+    ])
 
     return {
         "type": "drift",

@@ -169,6 +169,13 @@ QUALITY_DEFINITION_TEMPLATES = {
     "sonarr": "sonarr/includes/quality-definitions/sonarr-quality-definition-series.yml",
 }
 
+# TRaSH Guides custom-format index per service -- linked from suggestion PR bodies
+# so a reviewer can read the upstream description of a suggested CF.
+TRASH_CF_DOCS = {
+    "sonarr": "https://trash-guides.info/Sonarr/sonarr-collection-of-custom-formats/",
+    "radarr": "https://trash-guides.info/Radarr/radarr-collection-of-custom-formats/",
+}
+
 # claude-haiku-4-5, temperature 0 -- locked decisions for determinism + low cost.
 MODEL = "claude-haiku-4-5"
 TEMPERATURE = 0
@@ -448,11 +455,13 @@ SYSTEM_PROMPT = (
     "service, or you are genuinely unsure which profile fits best, still pick your "
     "single best guess and set assign_uncertain to true so a human reviews it.\n"
     "\n"
-    "For each suggested CF give: a one-sentence why_it_fits grounded in its "
-    "name/category and the user's profiles; a confidence of high, medium, or low; "
-    "the chosen assign_profile (an existing profile name); and assign_uncertain "
-    "(true when you are not confident about the profile choice). Output via the "
-    "provided tool only. Remember: no scores, ever."
+    "For each suggested CF give: a one-to-two sentence what_it_does that factually "
+    "describes what the custom format matches or does, grounded strictly in its "
+    "name and category (descriptive only -- never a score or value); a one-sentence "
+    "why_it_fits grounded in its name/category and the user's profiles; a confidence "
+    "of high, medium, or low; the chosen assign_profile (an existing profile name); "
+    "and assign_uncertain (true when you are not confident about the profile "
+    "choice). Output via the provided tool only. Remember: no scores, ever."
 )
 
 # Tool schema: deliberately NO score field anywhere. Structured JSON output keeps
@@ -474,6 +483,10 @@ SUGGESTION_TOOL = {
                         "trash_id": {"type": "string"},
                         "name": {"type": "string"},
                         "category": {"type": "string"},
+                        # A short, factual one-to-two sentence description of what
+                        # this custom format matches / does, grounded in its name +
+                        # category. Descriptive only -- never a score or value.
+                        "what_it_does": {"type": "string"},
                         "why_it_fits": {"type": "string"},
                         "confidence": {
                             "type": "string",
@@ -498,6 +511,10 @@ SUGGESTION_TOOL = {
                         "trash_id": {"type": "string"},
                         "name": {"type": "string"},
                         "category": {"type": "string"},
+                        # A short, factual one-to-two sentence description of what
+                        # this custom format matches / does, grounded in its name +
+                        # category. Descriptive only -- never a score or value.
+                        "what_it_does": {"type": "string"},
                         "why_it_fits": {"type": "string"},
                         "confidence": {
                             "type": "string",
@@ -693,9 +710,15 @@ def extract_assignments(raw_list, assignable_profile_names):
         uncertain = item.get("assign_uncertain")
         assign_uncertain = bool(uncertain) if isinstance(uncertain, bool) else True
 
+        # Descriptive blurb (optional, side-channel only -- kept OUT of the frozen
+        # suggestions.json schema, carried here purely to enrich the PR body).
+        blurb = item.get("what_it_does")
+        what_it_does = blurb.strip() if isinstance(blurb, str) else ""
+
         out[tid] = {
             "assign_profile": assign_profile,
             "assign_uncertain": assign_uncertain,
+            "what_it_does": what_it_does,
         }
     return out
 
@@ -800,11 +823,13 @@ def build_suggestion_change(service, suggestion, assignment, config_text,
 
     trash_id = suggestion["trash_id"]
     name = suggestion["name"]
+    category = suggestion.get("category") or "—"
     confidence = suggestion["confidence"]
     why = suggestion.get("why_it_fits", "")
 
     model_pick = assignment.get("assign_profile") if assignment else None
     model_uncertain = assignment.get("assign_uncertain", True) if assignment else True
+    what_it_does = (assignment.get("what_it_does") if assignment else "") or ""
 
     names = list(assignable_profile_names or [])
     fell_back = False
@@ -832,18 +857,27 @@ def build_suggestion_change(service, suggestion, assignment, config_text,
               .format(service, trash_id, exc), file=sys.stderr)
         return None
 
-    source = (
-        "https://github.com/recyclarr/config-templates "
-        "(scores come from the TRaSH guide on opt-in)"
-    )
+    cf_docs = TRASH_CF_DOCS.get(service, "https://trash-guides.info/")
+    conf_icon = {"high": "🟢", "medium": "🟡", "low": "🔴"}.get(confidence, "")
+
+    # Scannable layout: a fact table up top, then short labelled sections.
     body_lines = [
-        "**Add custom format** `{}` (`{}`) to **{}**.".format(name, trash_id, service),
+        "## ➕ Add custom format",
         "",
-        "**Why it fits:** {}".format(why or "(fits the user's profiles)"),
+        "| | |",
+        "|---|---|",
+        "| **Name** | {} |".format(name),
+        "| **trash_id** | `{}` |".format(trash_id),
+        "| **Service** | {} |".format(service),
+        "| **Category** | {} |".format(category),
+        "| **Assign to profile** | `{}` |".format(assign_profile),
+        "| **Confidence** | {} {} |".format(conf_icon, confidence),
         "",
-        "**Assign to profile:** `{}`".format(assign_profile),
+        "### What it does",
+        what_it_does or "_(no description available)_",
         "",
-        "**Confidence:** {}".format(confidence),
+        "### Why it fits your setup",
+        why or "_(fits the user's profiles)_",
     ]
     if uncertain:
         reason = ("the model flagged the profile choice as uncertain"
@@ -852,14 +886,18 @@ def build_suggestion_change(service, suggestion, assignment, config_text,
                        "existing profile was used as a best guess")
         body_lines += [
             "",
-            "> ⚠️ **Uncertain:** {}. Please confirm the `assign_scores_to` "
-            "profile before merging.".format(reason),
+            "### ⚠️ Needs your review",
+            "{}. Confirm the `assign_scores_to` profile (**`{}`**) before merging."
+            .format(reason[0].upper() + reason[1:], assign_profile),
         ]
     body_lines += [
         "",
-        "_Note: no score is set here. Scores come from the TRaSH guide on opt-in._",
+        "### Notes",
+        "- No score is set — `assign_scores_to` carries only the profile name. "
+        "Scores come from the TRaSH guide on opt-in.",
         "",
-        "Source: {}".format(source),
+        "### Source",
+        "[TRaSH Guides — {} custom formats]({})".format(service, cf_docs),
     ]
 
     return {
@@ -920,19 +958,24 @@ def build_settings_change(service, intent_bucket, config_text):
     rel = QUALITY_DEFINITION_TEMPLATES[service]
     source = CONFIG_TEMPLATES_RAW_BASE + rel
     body = "\n".join([
-        "**Align quality definition** for **{}**.".format(service),
+        "## ⚙️ Align quality definition",
         "",
-        "Set `{}` to `{}`.".format(dotted_path, qtype),
+        "| | |",
+        "|---|---|",
+        "| **Setting** | `{}` |".format(dotted_path),
+        "| **New value** | `{}` |".format(qtype),
+        "| **Service** | {} |".format(service),
         "",
-        "This value is taken verbatim from recyclarr's own config template "
-        "(`{}`), not invented. recyclarr uses the quality definition to size each "
-        "quality tier; aligning it matches the upstream-recommended baseline for "
-        "this service.".format(rel),
+        "### What it does",
+        "recyclarr uses the quality definition to size each quality tier. This sets "
+        "the type to the upstream-recommended baseline for **{}**.".format(service),
         "",
-        "_Note: no score is set here -- this only sets the quality definition type. "
-        "Scores come from the TRaSH guide on opt-in._",
+        "### Source",
+        "Value taken **verbatim** from recyclarr's config template (not invented): "
+        "[`{}`]({})".format(rel, source),
         "",
-        "Source: {}".format(source),
+        "### Notes",
+        "- Sets only the quality-definition type. No scores are set here.",
     ])
 
     return {
