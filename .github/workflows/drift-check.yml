@@ -70,7 +70,7 @@ jobs:
 
       - name: Cache recyclarr image
         id: rccache
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: /tmp/recyclarr-image.tar
           key: recyclarr-image-${{ steps.rcimg.outputs.digest }}
