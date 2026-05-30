@@ -162,7 +162,6 @@ radarr:
 
           # Language Profiles
           - d6e9318c875905d6cfb5bee961afcea9 # Language: Not Original
-          - deadbeefdeadbeefdeadbeefdeadbeef # TEMP test id (not upstream) — reverted after
 
         assign_scores_to:
           - name: Default
