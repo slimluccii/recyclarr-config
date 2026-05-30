@@ -1,6 +1,0 @@
-{
-  // recyclarr uses the custom `!env_var VAR_NAME` YAML tag for secrets. The Red Hat
-  // YAML extension doesn't know it and flags "Unresolved tag: !env_var". Declaring
-  // it as a scalar tag here silences the false error (runtime handling is unaffected).
-  "yaml.customTags": ["!env_var scalar"]
-}
