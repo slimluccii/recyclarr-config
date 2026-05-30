@@ -1,0 +1,15 @@
+{
+  // recyclarr uses the custom `!env_var VAR_NAME` YAML tag for secrets. Zed's YAML
+  // language server (yaml-language-server / Red Hat) flags it as
+  // "Unresolved tag: !env_var". Declaring it as a scalar tag silences the false
+  // error; runtime handling (recyclarr + the CI scripts) is unaffected.
+  "lsp": {
+    "yaml-language-server": {
+      "settings": {
+        "yaml": {
+          "customTags": ["!env_var scalar"]
+        }
+      }
+    }
+  }
+}
