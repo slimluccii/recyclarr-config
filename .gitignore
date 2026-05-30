@@ -1,2 +1,5 @@
 .claude/
 docs/superpowers/
+.env
+# Re-include the example file (a global ~/.gitignore `.env.*` rule would hide it).
+!.env.example
