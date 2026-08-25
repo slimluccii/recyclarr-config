@@ -163,6 +163,8 @@ radarr:
           # Language Profiles
           - d6e9318c875905d6cfb5bee961afcea9 # Language: Not Original
 
+          # Accessibility (Optional)
+          - 127bdbadcf3e4463a8c707759fbaad75 # WiTH AD
         assign_scores_to:
           - name: Default
 
@@ -298,6 +300,9 @@ sonarr:
 
           # Language Profiles
           - ae575f95ab639ba5d15f663bf019e3e8 # Language Not Original
+
+          # Accessibility (Optional)
+          - 44ccbcbc74506f208973e1463b11705f # WiTH AD
         assign_scores_to:
           - name: Default
 
