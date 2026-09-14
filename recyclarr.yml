@@ -78,6 +78,7 @@ radarr:
           # HDR Formats
           - 493b6d1dbec3c3364c59d7607f7e3405 # HDR
           - b337d6812e06c200ec9a2d3cfa9d20a7 # DV-Boost
+          - caa37d0df9c348912df1fb1d88f9273a # HDR10Plus Boost
 
           # HDR Optional
           - f700d29429c023a5734505e77daeaea7 # DV (Disk)
@@ -225,6 +226,7 @@ sonarr:
           # HDR Formats
           - 505d871304820ba7106b693be6fe4a9e # HDR
           - 7c3a61a9c6cb04f52f1544be6d44a026 # DV Boost
+          - 0c4b99df9206d2cfac3c05ab897dd62a # HDR10Plus Boost
 
           # HDR Optional
           - ef4963043b0987f8485bc9106f16db38 # DV (Disk)
